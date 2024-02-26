@@ -4,8 +4,6 @@ use (
 	./core
 	./matchmaker-example
 	./mmf
-	./mmfc
 	./pkg/api/v2
 	./pkg/pb/v2
-	./tmp
 )
