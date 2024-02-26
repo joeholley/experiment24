@@ -1,0 +1,150 @@
+// Copyright 2019 Google LLC
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+syntax = "proto3";
+package open_match.v2;
+option go_package = "open-match.dev/pkg/pb/v2";
+option csharp_namespace = "OpenMatch";
+
+//import "google/rpc/status.proto";
+import "google/protobuf/any.proto";
+import "google/protobuf/timestamp.proto";
+
+// A Ticket is a basic matchmaking entity in Open Match. A Ticket may represent
+// an individual 'Player', a 'Group' of players, or any other concepts unique to
+// your use case. Open Match will not interpret what the Ticket represents but
+// just treat it as a matchmaking unit with a set of SearchFields.
+message Ticket {
+  string id = 1; // auto-generated Id populated by Open Match.
+
+  // Fields indexed by Open Match which can be used when specifying filters.
+  // NOTE:
+  // Every field that you populate in this data structure consumes significant Open Match core CPU & memory! 
+  // Be frugal and only use this data structure for fields you will use to construct Ticket Pools;
+  // if you just want to access some ticket-specific data in your matchmaker or MMF, 
+  // put it in the Ticket's more efficient 'extensions' field instead, which Open Match 
+  // just stores and forwards to your code without additional parsing, indexing, or processing.
+  message FilterableData {
+    repeated string tags = 1;               // Strings, filterable on presence of tag.
+    map<string, string> string_args = 2;    // key+value pairs, string values filterable on equality.
+    map<string, double> double_args = 3;    // key+value pairs, float values filterable on ranges.
+
+    // Override-able timestamps. Open Match will populate these automatically if you don't 
+    // specify values at creation time.
+    google.protobuf.Timestamp creation_time = 4;    // OM defaults to the current time. 
+    google.protobuf.Timestamp expiration_time = 5;  // OM defaults to the current time + the ticket expiration configured in OM. 
+  }  
+  FilterableData attributes = 2; // fields which Open Match filters can access 
+
+  // Optional, user-customized information (ignored by Open Match)
+  map<string, google.protobuf.Any> extensions = 3;
+}
+
+// An Assignment represents a game server assignment associated with a Ticket.
+message Assignment {
+  string connection = 1; // Connection information for this Assignment.
+
+  // Optional, user-customized information (ignored by Open Match)
+  map<string, google.protobuf.Any> extensions = 2;
+}
+
+// Pool specfies a set of criteria that are used to select a subset of Tickets
+// that meet all the criteria.
+message Pool {
+  string name = 1; // A developer-chosen human-readable name for this Pool.
+  
+  // enum used in filters to determine if they are inclusive or exclusive of min/max values.
+  enum Bounds {
+    option allow_alias = true; 
+    EXCLUDE_NONE = 0; // MIN <= x <= MAX, i.e. Both bounds are included in results     
+    INCLUDE_BOTH = 0;
+    
+    EXCLUDE_MIN = 1;  // MIN <  x <= MAX, i.e. The minimum bound is excluded from results 
+    EXCLUDE_START = 1;
+    INCLUDE_MAX_ONLY = 1;
+  
+    EXCLUDE_MAX = 2;  // MIN <= x <  MAX, i.e. The maximum bound is excluded from results
+    EXCLUDE_END = 2;
+    INCLUDE_MIN_ONLY = 2;
+  
+    EXCLUDE_BOTH = 3; // MIN <  x <  MAX, i.e. Both bounds are excluded from results
+    INCLUDE_NONE = 3;
+  }
+
+  // Set of Filters. Tickets in this pool match all filters below. 
+  // Filters only access data in the Ticket's "attributes" field.
+  //  (A Pool is an 'intersection', in mathematical set terms)
+  message TagPresentFilter { 
+    string tag = 1; 
+  }
+  repeated TagPresentFilter tag_present_filters = 2;
+
+   message StringEqualsFilter {
+    string string_arg = 1; // Which map key of the ticket's search_fields.string_args to filter
+    string value = 2;
+  }
+  repeated StringEqualsFilter string_equals_filters = 3;
+  
+  message DoubleRangeFilter {
+    string double_arg = 1; // Which map key of the ticket's search_fields.double_args to filter
+    double minimum = 2;
+    double maximum = 3;
+    Bounds bounds = 4;     // Defines the bounds to apply when filtering tickets
+  }
+  repeated DoubleRangeFilter double_range_filters = 4;
+  
+  message TimeFilter {
+    // Compares against the 'creation_time' field of the Ticket 'attributes'.
+    google.protobuf.Timestamp start = 6;
+    google.protobuf.Timestamp end = 7;
+    Bounds bounds = 4; // Defines the bounds to apply when filtering tickets
+  }
+  TimeFilter time_filter = 5;
+
+  // Output_only Participants are populated by the open match InvokeMatchMakingFunction RPC.
+  Roster participants = 6; // The tickets in open match that match all the filters of this Pool.
+  
+  // Optional, user-customized information (ignored by Open Match)
+  map<string, google.protobuf.Any> extensions = 7;
+}
+
+message Profile {
+  string name = 1; // Name of this match profile.
+  map<string, Pool> pools = 2;  // Set of pools to be queried and sent to the matchfunction 
+  map<string, Roster> rosters = 3;
+
+  // Optional, user-customized information (ignored by Open Match)
+  map<string, google.protobuf.Any> extensions = 4;
+}
+
+message Match {
+  string id = 1;        // A Match ID added to telemetry. Used to correlate matches to logs and traces.
+  int32 score = 2;      // Score representing the MMF's judgement of the match quality/priority.
+  string profile = 3;   // Name of the match profile that resulted in this Match.
+  string mmf= 4;        // Name of the matchmaking function that generated this Match.
+  map<string, Roster> rosters = 5; // Tickets belonging to this match.
+
+  // Optional, user-customized information (ignored by Open Match)
+  map<string, google.protobuf.Any> extensions = 6;
+}
+
+// A Roster is a group of Tickets that share an assignment.
+message Roster {
+  string name = 1;
+  Assignment assignment = 2;
+  repeated Ticket tickets = 3;
+  
+  // Optional, user-customized information (ignored by Open Match)
+  map<string, google.protobuf.Any> extensions = 4;
+}

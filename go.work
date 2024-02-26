@@ -1,0 +1,11 @@
+go 1.21.5
+
+use (
+	./core
+	./matchmaker-example
+	./mmf
+	./mmfc
+	./pkg/api/v2
+	./pkg/pb/v2
+	./tmp
+)

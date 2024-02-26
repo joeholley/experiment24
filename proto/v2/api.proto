@@ -1,0 +1,123 @@
+// Copyright 2019 Google LLC
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+//
+// If you're modifying this file, please follow the protobuf style guide:
+//   https://protobuf.dev/programming-guides/style/
+// and also the Google API design guide
+//   https://cloud.google.com/apis/design/
+// also see the comments in the http grpc source file:
+//   https://github.com/googleapis/googleapis/blob/master/google/api/http.proto
+
+syntax = "proto3";
+package open_match.v2; // would be nice to match the domain name, alas: https://stackoverflow.com/a/63228588
+option go_package = "open-match.dev/pkg/pb/v2";
+option csharp_namespace = "OpenMatch";
+
+import "messages.proto";
+
+// CreateTicket forcably assigns an unique TicketId and puts the ticket into state storage.
+message CreateTicketRequest  { Ticket ticket = 1; }
+message CreateTicketResponse { string ticket_id = 1; }
+
+// DeactivateTicket removes the Ticket from state storage asynchronously.
+message DeactivateTicketRequest  { string ticket_id = 1; }
+message DeactivateTicketResponse { }
+
+// ActivateTickets moves tickets from the inactive state back to the active state (will show up in pools).
+message ActivateTicketsRequest  { repeated string ticket_ids = 1; }
+message ActivateTicketsResponse { }
+
+// MmfRequest is sent to the InvokeMatchmakingFunction() rpc call to define how to call
+// your mmf, and what arguments to send it.
+message MmfRequest {
+  Profile profile = 1;                      // A Profile to send to the MatchMakingFunction(s)
+
+  // specify MMF address and client type
+  message MatchmakingFunction {
+    string host = 1;
+    int32 port = 2;
+    Type type = 3;
+    enum Type {
+      GRPC = 0;
+      REST = 1;
+    }
+  }
+  repeated MatchmakingFunction mmfs = 2;    // List of MatchMakingfunctions to invoke.
+}
+message StreamedMmfResponse { Match match = 1; }
+
+// DEV/TEST ONLY - DO NOT USE IN PRODUCTION
+// CreateAssignments creates an assignment for all Tickets in this Roster. These assignments can be retrieved 
+// with the Ticket ID using the WatchAssignments rpc.
+message CreateAssignmentsRequest  { Roster assignment_roster = 1; }
+message CreateAssignmentsResponse { }
+
+// DEV/TEST ONLY - DO NOT USE IN PRODUCTION
+// WatchAssignments streams back results of the AssignTickets RPC that affected these TicketIds.
+message         WatchAssignmentsRequest  { repeated string ticket_ids = 1; }
+message StreamedWatchAssignmentsResponse { Assignment assignment = 1; string id = 2; }
+
+service OpenMatchService {
+  // CreateTicket puts an immutable ticket into state storage, and returns it's Ticket Id.
+  // Tickets will be actively expired after the configured OM_TICKET_TTL_SECS has passed. 
+  // Tickets are placed in the 'inactive' state when created (they will not show up in
+  //  pools sent to your matchmaking functions).  Use the ActivateTickets() RPC to move
+  //  it to the 'active' state.
+  rpc CreateTicket(CreateTicketRequest)             returns (CreateTicketResponse) { }
+
+  // Deactivate tickets takes a list of ticket ids which it will move to the 'inactive'
+  // state (they will not show up inpools sent to your matchmaking functions). Use the 
+  // ActivateTickets() RPC to move tickets back to the 'active' state.
+  rpc DeactivateTicket(DeactivateTicketRequest)     returns (DeactivateTicketResponse) { }
+
+  // Activate tickets takes a list of ticket ids which it will move to the 'active' state
+  // (meaning they will show up in pools sent to your matchmaking functions).
+  rpc ActivateTickets(ActivateTicketsRequest)       returns (ActivateTicketsResponse) { }
+
+  // InvokeMatchmakingFunctions is the core of open match. As input, it receives:
+  // - A Match Profile, consisting of:
+  //  - A list of empty ticket pools, with filters defining how to find all
+  //    players that belong to that pool. 
+  //  - A list of empty rosters, representing groups of tickets to assign to the resulting
+  //    match. This is an optional construct but often used to represent teams (see
+  //    the example matchmaking functions and the docs for more details)
+  // - A list of matchmaking function (aka MMF) endpoints
+  // The RPC first looks at the pools in the request profile, and evaluates all the filters
+  // in each to fill the pools with eligible tickets. Once all pools in the profile are 
+  // filled with all eligible tickets, a copy of the profile is sent to each matchmaking
+  // function endpoint specified in the request. MMF calls are defined by a separate gRPC
+  // service defined in proto/v2/mmf.proto, please reference it for details as to the input
+  // and output of matchmaking functions.
+  // All matches returned from all MMFs before the context deadline are then sent back 
+  // to OM's InvokeMatchmakingFunctions handler, which does the following:
+  // - Reads all rosters of all matches returned, and moves every ticket it finds in those
+  //    rosters to the 'inactive' state.
+  // - Records statistics/telemetry for the results.
+  // - Sends those results out the output stream as a StreamedMmfResponse 
+  // Note: cancelling the context (by, for example, closing the connection) does NOT
+  //    cancel the invoked MMFs, by design. They will run, make matches, and exit 
+  //    when they finish.
+  rpc InvokeMatchmakingFunctions(MmfRequest)        returns (stream StreamedMmfResponse) { }
+
+  // *** NOTE: DEPRECATED RPCs BELOW, DO NOT USE IN PRODUCTION ***
+
+  // CreateAssignments creates an assignment for each ticket in the request's AssignmentRoster
+  // field. Assignments are only guaranteed to exist until the ticket expires, although they MAY
+  // continue to exist afterwords. This RPC is considered deprecated and should not be used in production.
+  rpc CreateAssignments(CreateAssignmentsRequest)   returns (CreateAssignmentsResponse) { }
+
+  // WatchAssignments streams back one assignment of each ticketID requested, if it exists before the 
+  // timeout is reached. This RPC is considered deprecated and should not be used in production.
+  rpc WatchAssignments(WatchAssignmentsRequest)     returns (stream StreamedWatchAssignmentsResponse) { }
+}
