@@ -1,4 +1,4 @@
-module open-match.dev/matchmaker-sample
+module open-match.dev/matchmaker-example
 
 go 1.21
 
