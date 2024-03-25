@@ -1,9 +1,14 @@
-go 1.21.5
+go 1.21.6
 
 use (
 	./core
+	./functions/golang/battleroyale
+	./functions/golang/soloduel
 	./matchmaker-example
 	./mmf
+	./mmf/server
+	./mmfc
 	./pkg/api/v2
 	./pkg/pb/v2
+	./tmp
 )
