@@ -7,8 +7,6 @@ use (
 	./matchmaker-example
 	./mmf
 	./mmf/server
-	./mmfc
 	./pkg/api/v2
 	./pkg/pb/v2
-	./tmp
 )
