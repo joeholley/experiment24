@@ -11,6 +11,28 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 // See the License for the specific language governing permissions and
 // limitations under the License.
+//
+// If you're modifying this file, please follow the protobuf style guide:
+//   https://protobuf.dev/programming-guides/style/
+// and also the Google API design guide
+//   https://cloud.google.com/apis/design/
+// also see the comments in the http grpc source file:
+//   https://github.com/googleapis/googleapis/blob/master/google/api/http.proto
+// -----------------------------------------------------
+// 
+// Every message type used by Open Match has an extensions field that can carry
+// any kind of data. This field is ignored by Open Match core and simply passed
+// through from your matchmaker to your match function invocations and back
+// again.  
+//
+// ALL OTHER FIELDS /ARE/ processed by Open Match core in some way. 
+//
+// If a message is updated, those updates should follow this convention: 
+// Data that Open Match Core DOES NOT access in the course of providing core
+// API functionality MUST NOT be specified as a named field. It MUST instead be
+// passed through the extensions field. In cases where either would 
+// work, preference should be given to passing the data through the extensions
+// field and leaving the protos as-is. 
 
 syntax = "proto3";
 package open_match.v2;
@@ -26,7 +48,10 @@ import "google/protobuf/timestamp.proto";
 // your use case. Open Match will not interpret what the Ticket represents but
 // just treat it as a matchmaking unit with a set of SearchFields.
 message Ticket {
-  string id = 1; // auto-generated Id populated by Open Match.
+  // auto-generated Id populated by Open Match.
+  string id = 1;
+  // Open Match populates to (the current time + OM_TICKET_TTL_SECS)
+  google.protobuf.Timestamp expiration_time = 2;  
 
   // Fields indexed by Open Match which can be used when specifying filters.
   // NOTE:
@@ -40,15 +65,15 @@ message Ticket {
     map<string, string> string_args = 2;    // key+value pairs, string values filterable on equality.
     map<string, double> double_args = 3;    // key+value pairs, float values filterable on ranges.
 
-    // Override-able timestamps. Open Match will populate these automatically if you don't 
-    // specify values at creation time.
-    google.protobuf.Timestamp creation_time = 4;    // OM defaults to the current time. 
-    google.protobuf.Timestamp expiration_time = 5;  // OM defaults to the current time + the ticket expiration configured in OM. 
+    // Override-able timestamp. 
+    // Open Match will populate this with the current time
+    // if you don't specify a value at ticket creation. 
+    google.protobuf.Timestamp creation_time = 4;
   }  
-  FilterableData attributes = 2; // fields which Open Match filters can access 
+  FilterableData attributes = 3; // fields which Open Match filters can access 
 
   // Optional, user-customized information (ignored by Open Match)
-  map<string, google.protobuf.Any> extensions = 3;
+  map<string, google.protobuf.Any> extensions = 4;
 }
 
 // An Assignment represents a game server assignment associated with a Ticket.
@@ -62,10 +87,10 @@ message Assignment {
 // Pool specfies a set of criteria that are used to select a subset of Tickets
 // that meet all the criteria.
 message Pool {
-  string name = 1; // A developer-chosen human-readable name for this Pool.
+  string name = 1; // User-defined name. Used to correlate logs, traces, and telemetry. 
   
   // enum used in filters to determine if they are inclusive or exclusive of min/max values.
-  enum Bounds {
+  enum FilterBounds {
     option allow_alias = true; 
     EXCLUDE_NONE = 0; // MIN <= x <= MAX, i.e. Both bounds are included in results     
     INCLUDE_BOTH = 0;
@@ -100,17 +125,17 @@ message Pool {
     string double_arg = 1; // Which map key of the ticket's search_fields.double_args to filter
     double minimum = 2;
     double maximum = 3;
-    Bounds bounds = 4;     // Defines the bounds to apply when filtering tickets
+    FilterBounds bounds = 4;     // Defines the bounds to apply when filtering tickets
   }
   repeated DoubleRangeFilter double_range_filters = 4;
   
-  message TimeFilter {
+  message CreationTimeRangeFilter {
     // Compares against the 'creation_time' field of the Ticket 'attributes'.
     google.protobuf.Timestamp start = 6;
     google.protobuf.Timestamp end = 7;
-    Bounds bounds = 4; // Defines the bounds to apply when filtering tickets
+    FilterBounds bounds = 4; // Defines the bounds to apply when filtering tickets
   }
-  TimeFilter time_filter = 5;
+  CreationTimeRangeFilter creation_time_range_filter = 5;
 
   // Output_only Participants are populated by the open match InvokeMatchMakingFunction RPC.
   Roster participants = 6; // The tickets in open match that match all the filters of this Pool.
@@ -120,23 +145,19 @@ message Pool {
 }
 
 message Profile {
-  string name = 1; // Name of this match profile.
+  string name = 1; // User-defined name. Used to correlate logs, traces, and telemetry.
   map<string, Pool> pools = 2;  // Set of pools to be queried and sent to the matchfunction 
-  map<string, Roster> rosters = 3;
 
   // Optional, user-customized information (ignored by Open Match)
-  map<string, google.protobuf.Any> extensions = 4;
+  map<string, google.protobuf.Any> extensions = 3;
 }
 
 message Match {
-  string id = 1;        // A Match ID added to telemetry. Used to correlate matches to logs and traces.
-  int32 score = 2;      // Score representing the MMF's judgement of the match quality/priority.
-  string profile = 3;   // Name of the match profile that resulted in this Match.
-  string mmf= 4;        // Name of the matchmaking function that generated this Match.
-  map<string, Roster> rosters = 5; // Tickets belonging to this match.
+  string id = 1; // User-defined Match ID added to telemetry. Used to correlate matches to logs and traces.
+  map<string, Roster> rosters = 2; // Tickets belonging to this match.
 
   // Optional, user-customized information (ignored by Open Match)
-  map<string, google.protobuf.Any> extensions = 6;
+  map<string, google.protobuf.Any> extensions = 3;
 }
 
 // A Roster is a group of Tickets that share an assignment.
@@ -148,3 +169,71 @@ message Roster {
   // Optional, user-customized information (ignored by Open Match)
   map<string, google.protobuf.Any> extensions = 4;
 }
+
+// specify MMF address and client type
+message MatchmakingFunctionSpec {
+  string name = 1; // User-defined name, used for logging and aggregating metrics.
+  string host = 2;
+  int32 port = 3;
+  Type type = 4;
+  enum Type {
+    REST = 0;
+    GRPC = 1;
+  }
+}
+
+// API reponse/request messages, used by api.proto and mmf.proto
+//--------------------------------------------------------------
+// Arguments sent to your MMF can be more than the maximum gRPC message size of
+// 4mb if you are sending a lot of tickets to your MMF. Your MMF should read
+// the stream of PagedMmfRunRequests until it is complete, and concatinate pool
+// participants based on pool name in order to reconstruct the full,
+// unpaginated ticket pools. 
+message ChunkedMmfRunRequest { 
+  // Part of a profile chunked to fit in max gRPC message size
+  Profile profile = 1;  
+  // How many chunks this profile is broken into
+  int32 num_chunks = 2;  
+}
+
+// CreateTicket forcably assigns an unique TicketId and puts the ticket into state storage.
+message CreateTicketRequest  { Ticket ticket = 1; }
+message CreateTicketResponse { string ticket_id = 1; }
+
+// DeactivateTicket removes the Ticket from state storage asynchronously.
+message DeactivateTicketsRequest  { repeated string ticket_ids = 1; }
+message DeactivateTicketsResponse { }
+
+// ActivateTickets moves tickets from the inactive state back to the active state (will show up in pools).
+message ActivateTicketsRequest  { repeated string ticket_ids = 1; }
+message ActivateTicketsResponse { }
+
+// MmfRequest is sent to the InvokeMatchmakingFunction() rpc call to define how
+// to call your mmf, and what arguments to send it.
+message MmfRequest {
+  // A Profile to send to the MatchMakingFunction(s)
+  Profile profile = 1;                      
+  // List of MatchMakingfunctions to invoke.
+  repeated MatchmakingFunctionSpec mmfs = 2;    
+}
+// A stream of matches. This is sent from your MMF to om-core, and om-core in
+// turn sends this back to your matchmaker. Max message size is default 4MB, 
+// and om-core does not try to increase it; as a result you should return 
+// matches that are less than 4mb each or you'll get RPC errors.
+// Although typical best pratice recommends defining separate reponse types
+// for the mmf.Run() and om-core.InvokeMmfs() RPCs, here we've intentionally
+// made them share a response message so it's completely clear that your
+// mmf response to om-core will be exactly what om-core returns to your 
+// matchmaker.
+message StreamedMmfResponse { Match match = 1; }
+
+// DEV/TEST ONLY - DO NOT USE IN PRODUCTION
+// CreateAssignments creates an assignment for all Tickets in this Roster. These assignments can be retrieved 
+// with the Ticket ID using the WatchAssignments rpc.
+message CreateAssignmentsRequest  { Roster assignment_roster = 1; }
+message CreateAssignmentsResponse { }
+
+// DEV/TEST ONLY - DO NOT USE IN PRODUCTION
+// WatchAssignments streams back results of the AssignTickets RPC that affected these TicketIds.
+message         WatchAssignmentsRequest  { repeated string ticket_ids = 1; }
+message StreamedWatchAssignmentsResponse { Assignment assignment = 1; string id = 2; }

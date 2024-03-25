@@ -40,10 +40,11 @@ const (
 //
 // For semantics around ctx use and closing/ending streaming RPCs, please refer to https://pkg.go.dev/google.golang.org/grpc/?tab=doc#ClientConn.NewStream.
 type MatchMakingFunctionServiceClient interface {
-	// INTERNAL USE ONLY
-	// -----------------------------------------------------------------------------------------------------
-	// This is the specification open match uses to call your matchmaking function on your behalf.
-	Run(ctx context.Context, in *Profile, opts ...grpc.CallOption) (MatchMakingFunctionService_RunClient, error)
+	// INTERNAL USE ONLY This is the specification open match uses to call your
+	// matchmaking function on your behalf. Your MMF must handle this endpoint,
+	// but your matchmaker should never call this directly, instead using
+	// om-core's InvokeMatchmakingFunctions() API.
+	Run(ctx context.Context, opts ...grpc.CallOption) (MatchMakingFunctionService_RunClient, error)
 }
 
 type matchMakingFunctionServiceClient struct {
@@ -54,23 +55,18 @@ func NewMatchMakingFunctionServiceClient(cc grpc.ClientConnInterface) MatchMakin
 	return &matchMakingFunctionServiceClient{cc}
 }
 
-func (c *matchMakingFunctionServiceClient) Run(ctx context.Context, in *Profile, opts ...grpc.CallOption) (MatchMakingFunctionService_RunClient, error) {
+func (c *matchMakingFunctionServiceClient) Run(ctx context.Context, opts ...grpc.CallOption) (MatchMakingFunctionService_RunClient, error) {
 	stream, err := c.cc.NewStream(ctx, &MatchMakingFunctionService_ServiceDesc.Streams[0], MatchMakingFunctionService_Run_FullMethodName, opts...)
 	if err != nil {
 		return nil, err
 	}
 	x := &matchMakingFunctionServiceRunClient{stream}
-	if err := x.ClientStream.SendMsg(in); err != nil {
-		return nil, err
-	}
-	if err := x.ClientStream.CloseSend(); err != nil {
-		return nil, err
-	}
 	return x, nil
 }
 
 type MatchMakingFunctionService_RunClient interface {
-	Recv() (*Match, error)
+	Send(*ChunkedMmfRunRequest) error
+	Recv() (*StreamedMmfResponse, error)
 	grpc.ClientStream
 }
 
@@ -78,8 +74,12 @@ type matchMakingFunctionServiceRunClient struct {
 	grpc.ClientStream
 }
 
-func (x *matchMakingFunctionServiceRunClient) Recv() (*Match, error) {
-	m := new(Match)
+func (x *matchMakingFunctionServiceRunClient) Send(m *ChunkedMmfRunRequest) error {
+	return x.ClientStream.SendMsg(m)
+}
+
+func (x *matchMakingFunctionServiceRunClient) Recv() (*StreamedMmfResponse, error) {
+	m := new(StreamedMmfResponse)
 	if err := x.ClientStream.RecvMsg(m); err != nil {
 		return nil, err
 	}
@@ -90,10 +90,11 @@ func (x *matchMakingFunctionServiceRunClient) Recv() (*Match, error) {
 // All implementations must embed UnimplementedMatchMakingFunctionServiceServer
 // for forward compatibility
 type MatchMakingFunctionServiceServer interface {
-	// INTERNAL USE ONLY
-	// -----------------------------------------------------------------------------------------------------
-	// This is the specification open match uses to call your matchmaking function on your behalf.
-	Run(*Profile, MatchMakingFunctionService_RunServer) error
+	// INTERNAL USE ONLY This is the specification open match uses to call your
+	// matchmaking function on your behalf. Your MMF must handle this endpoint,
+	// but your matchmaker should never call this directly, instead using
+	// om-core's InvokeMatchmakingFunctions() API.
+	Run(MatchMakingFunctionService_RunServer) error
 	mustEmbedUnimplementedMatchMakingFunctionServiceServer()
 }
 
@@ -101,7 +102,7 @@ type MatchMakingFunctionServiceServer interface {
 type UnimplementedMatchMakingFunctionServiceServer struct {
 }
 
-func (UnimplementedMatchMakingFunctionServiceServer) Run(*Profile, MatchMakingFunctionService_RunServer) error {
+func (UnimplementedMatchMakingFunctionServiceServer) Run(MatchMakingFunctionService_RunServer) error {
 	return status.Errorf(codes.Unimplemented, "method Run not implemented")
 }
 func (UnimplementedMatchMakingFunctionServiceServer) mustEmbedUnimplementedMatchMakingFunctionServiceServer() {
@@ -119,15 +120,12 @@ func RegisterMatchMakingFunctionServiceServer(s grpc.ServiceRegistrar, srv Match
 }
 
 func _MatchMakingFunctionService_Run_Handler(srv interface{}, stream grpc.ServerStream) error {
-	m := new(Profile)
-	if err := stream.RecvMsg(m); err != nil {
-		return err
-	}
-	return srv.(MatchMakingFunctionServiceServer).Run(m, &matchMakingFunctionServiceRunServer{stream})
+	return srv.(MatchMakingFunctionServiceServer).Run(&matchMakingFunctionServiceRunServer{stream})
 }
 
 type MatchMakingFunctionService_RunServer interface {
-	Send(*Match) error
+	Send(*StreamedMmfResponse) error
+	Recv() (*ChunkedMmfRunRequest, error)
 	grpc.ServerStream
 }
 
@@ -135,8 +133,16 @@ type matchMakingFunctionServiceRunServer struct {
 	grpc.ServerStream
 }
 
-func (x *matchMakingFunctionServiceRunServer) Send(m *Match) error {
+func (x *matchMakingFunctionServiceRunServer) Send(m *StreamedMmfResponse) error {
 	return x.ServerStream.SendMsg(m)
+}
+
+func (x *matchMakingFunctionServiceRunServer) Recv() (*ChunkedMmfRunRequest, error) {
+	m := new(ChunkedMmfRunRequest)
+	if err := x.ServerStream.RecvMsg(m); err != nil {
+		return nil, err
+	}
+	return m, nil
 }
 
 // MatchMakingFunctionService_ServiceDesc is the grpc.ServiceDesc for MatchMakingFunctionService service.
@@ -151,6 +157,7 @@ var MatchMakingFunctionService_ServiceDesc = grpc.ServiceDesc{
 			StreamName:    "Run",
 			Handler:       _MatchMakingFunctionService_Run_Handler,
 			ServerStreams: true,
+			ClientStreams: true,
 		},
 	},
 	Metadata: "mmf.proto",

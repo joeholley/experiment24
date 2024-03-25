@@ -26,63 +26,22 @@ option csharp_namespace = "OpenMatch";
 
 import "messages.proto";
 
-// CreateTicket forcably assigns an unique TicketId and puts the ticket into state storage.
-message CreateTicketRequest  { Ticket ticket = 1; }
-message CreateTicketResponse { string ticket_id = 1; }
-
-// DeactivateTicket removes the Ticket from state storage asynchronously.
-message DeactivateTicketRequest  { string ticket_id = 1; }
-message DeactivateTicketResponse { }
-
-// ActivateTickets moves tickets from the inactive state back to the active state (will show up in pools).
-message ActivateTicketsRequest  { repeated string ticket_ids = 1; }
-message ActivateTicketsResponse { }
-
-// MmfRequest is sent to the InvokeMatchmakingFunction() rpc call to define how to call
-// your mmf, and what arguments to send it.
-message MmfRequest {
-  Profile profile = 1;                      // A Profile to send to the MatchMakingFunction(s)
-
-  // specify MMF address and client type
-  message MatchmakingFunction {
-    string host = 1;
-    int32 port = 2;
-    Type type = 3;
-    enum Type {
-      GRPC = 0;
-      REST = 1;
-    }
-  }
-  repeated MatchmakingFunction mmfs = 2;    // List of MatchMakingfunctions to invoke.
-}
-message StreamedMmfResponse { Match match = 1; }
-
-// DEV/TEST ONLY - DO NOT USE IN PRODUCTION
-// CreateAssignments creates an assignment for all Tickets in this Roster. These assignments can be retrieved 
-// with the Ticket ID using the WatchAssignments rpc.
-message CreateAssignmentsRequest  { Roster assignment_roster = 1; }
-message CreateAssignmentsResponse { }
-
-// DEV/TEST ONLY - DO NOT USE IN PRODUCTION
-// WatchAssignments streams back results of the AssignTickets RPC that affected these TicketIds.
-message         WatchAssignmentsRequest  { repeated string ticket_ids = 1; }
-message StreamedWatchAssignmentsResponse { Assignment assignment = 1; string id = 2; }
-
 service OpenMatchService {
   // CreateTicket puts an immutable ticket into state storage, and returns it's Ticket Id.
   // Tickets will be actively expired after the configured OM_TICKET_TTL_SECS has passed. 
   // Tickets are placed in the 'inactive' state when created (they will not show up in
   //  pools sent to your matchmaking functions).  Use the ActivateTickets() RPC to move
-  //  it to the 'active' state.
+  //  them to the 'active' state.
   rpc CreateTicket(CreateTicketRequest)             returns (CreateTicketResponse) { }
 
   // Deactivate tickets takes a list of ticket ids which it will move to the 'inactive'
-  // state (they will not show up inpools sent to your matchmaking functions). Use the 
-  // ActivateTickets() RPC to move tickets back to the 'active' state.
-  rpc DeactivateTicket(DeactivateTicketRequest)     returns (DeactivateTicketResponse) { }
+  // state and returns the (estimated) completion time, after which the tickets will no
+  // longer appear in pools sent to new matchmaking function invocations.
+  rpc DeactivateTickets(DeactivateTicketsRequest)     returns (DeactivateTicketsResponse) { }
 
-  // Activate tickets takes a list of ticket ids which it will move to the 'active' state
-  // (meaning they will show up in pools sent to your matchmaking functions).
+  // Activate tickets takes a list of ticket ids which it will move to the 'active' 
+  // state and returns the (estimated) completion time, after which the ticket will
+  // appear in pools sent to new matchmaking function invocations.
   rpc ActivateTickets(ActivateTicketsRequest)       returns (ActivateTicketsResponse) { }
 
   // InvokeMatchmakingFunctions is the core of open match. As input, it receives:

@@ -9,8 +9,9 @@ http:
       post: /v2/tickets
       body: "*"
 
-    - selector: open_match.v2.OpenMatchService.DeactivateTicket
-      delete: /v2/tickets/{ticket_id}
+    - selector: open_match.v2.OpenMatchService.DeactivateTickets
+      delete: /v2/tickets:deactivate
+      body: "*"
 
     - selector: open_match.v2.OpenMatchService.ActivateTickets
       post: /v2/tickets:activate

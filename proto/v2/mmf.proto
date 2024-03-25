@@ -20,8 +20,9 @@ option csharp_namespace = "OpenMatch";
 import "messages.proto";
 
 service MatchMakingFunctionService {
-  // INTERNAL USE ONLY
-  // -----------------------------------------------------------------------------------------------------
-  // This is the specification open match uses to call your matchmaking function on your behalf.
-  rpc Run(Profile) returns (stream Match) { }
+  // INTERNAL USE ONLY This is the specification open match uses to call your
+  // matchmaking function on your behalf. Your MMF must handle this endpoint,
+  // but your matchmaker should never call this directly, instead using
+  // om-core's InvokeMatchmakingFunctions() API.
+  rpc Run(stream ChunkedMmfRunRequest) returns (stream StreamedMmfResponse) { }
 }

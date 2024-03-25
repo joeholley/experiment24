@@ -41,7 +41,7 @@ const _ = grpc.SupportPackageIsVersion7
 
 const (
 	OpenMatchService_CreateTicket_FullMethodName               = "/open_match.v2.OpenMatchService/CreateTicket"
-	OpenMatchService_DeactivateTicket_FullMethodName           = "/open_match.v2.OpenMatchService/DeactivateTicket"
+	OpenMatchService_DeactivateTickets_FullMethodName          = "/open_match.v2.OpenMatchService/DeactivateTickets"
 	OpenMatchService_ActivateTickets_FullMethodName            = "/open_match.v2.OpenMatchService/ActivateTickets"
 	OpenMatchService_InvokeMatchmakingFunctions_FullMethodName = "/open_match.v2.OpenMatchService/InvokeMatchmakingFunctions"
 	OpenMatchService_CreateAssignments_FullMethodName          = "/open_match.v2.OpenMatchService/CreateAssignments"
@@ -57,14 +57,15 @@ type OpenMatchServiceClient interface {
 	// Tickets are placed in the 'inactive' state when created (they will not show up in
 	//
 	//	pools sent to your matchmaking functions).  Use the ActivateTickets() RPC to move
-	//	it to the 'active' state.
+	//	them to the 'active' state.
 	CreateTicket(ctx context.Context, in *CreateTicketRequest, opts ...grpc.CallOption) (*CreateTicketResponse, error)
 	// Deactivate tickets takes a list of ticket ids which it will move to the 'inactive'
-	// state (they will not show up inpools sent to your matchmaking functions). Use the
-	// ActivateTickets() RPC to move tickets back to the 'active' state.
-	DeactivateTicket(ctx context.Context, in *DeactivateTicketRequest, opts ...grpc.CallOption) (*DeactivateTicketResponse, error)
-	// Activate tickets takes a list of ticket ids which it will move to the 'active' state
-	// (meaning they will show up in pools sent to your matchmaking functions).
+	// state and returns the (estimated) completion time, after which the tickets will no
+	// longer appear in pools sent to new matchmaking function invocations.
+	DeactivateTickets(ctx context.Context, in *DeactivateTicketsRequest, opts ...grpc.CallOption) (*DeactivateTicketsResponse, error)
+	// Activate tickets takes a list of ticket ids which it will move to the 'active'
+	// state and returns the (estimated) completion time, after which the ticket will
+	// appear in pools sent to new matchmaking function invocations.
 	ActivateTickets(ctx context.Context, in *ActivateTicketsRequest, opts ...grpc.CallOption) (*ActivateTicketsResponse, error)
 	// InvokeMatchmakingFunctions is the core of open match. As input, it receives:
 	// - A Match Profile, consisting of:
@@ -119,9 +120,9 @@ func (c *openMatchServiceClient) CreateTicket(ctx context.Context, in *CreateTic
 	return out, nil
 }
 
-func (c *openMatchServiceClient) DeactivateTicket(ctx context.Context, in *DeactivateTicketRequest, opts ...grpc.CallOption) (*DeactivateTicketResponse, error) {
-	out := new(DeactivateTicketResponse)
-	err := c.cc.Invoke(ctx, OpenMatchService_DeactivateTicket_FullMethodName, in, out, opts...)
+func (c *openMatchServiceClient) DeactivateTickets(ctx context.Context, in *DeactivateTicketsRequest, opts ...grpc.CallOption) (*DeactivateTicketsResponse, error) {
+	out := new(DeactivateTicketsResponse)
+	err := c.cc.Invoke(ctx, OpenMatchService_DeactivateTickets_FullMethodName, in, out, opts...)
 	if err != nil {
 		return nil, err
 	}
@@ -219,14 +220,15 @@ type OpenMatchServiceServer interface {
 	// Tickets are placed in the 'inactive' state when created (they will not show up in
 	//
 	//	pools sent to your matchmaking functions).  Use the ActivateTickets() RPC to move
-	//	it to the 'active' state.
+	//	them to the 'active' state.
 	CreateTicket(context.Context, *CreateTicketRequest) (*CreateTicketResponse, error)
 	// Deactivate tickets takes a list of ticket ids which it will move to the 'inactive'
-	// state (they will not show up inpools sent to your matchmaking functions). Use the
-	// ActivateTickets() RPC to move tickets back to the 'active' state.
-	DeactivateTicket(context.Context, *DeactivateTicketRequest) (*DeactivateTicketResponse, error)
-	// Activate tickets takes a list of ticket ids which it will move to the 'active' state
-	// (meaning they will show up in pools sent to your matchmaking functions).
+	// state and returns the (estimated) completion time, after which the tickets will no
+	// longer appear in pools sent to new matchmaking function invocations.
+	DeactivateTickets(context.Context, *DeactivateTicketsRequest) (*DeactivateTicketsResponse, error)
+	// Activate tickets takes a list of ticket ids which it will move to the 'active'
+	// state and returns the (estimated) completion time, after which the ticket will
+	// appear in pools sent to new matchmaking function invocations.
 	ActivateTickets(context.Context, *ActivateTicketsRequest) (*ActivateTicketsResponse, error)
 	// InvokeMatchmakingFunctions is the core of open match. As input, it receives:
 	// - A Match Profile, consisting of:
@@ -272,8 +274,8 @@ type UnimplementedOpenMatchServiceServer struct {
 func (UnimplementedOpenMatchServiceServer) CreateTicket(context.Context, *CreateTicketRequest) (*CreateTicketResponse, error) {
 	return nil, status.Errorf(codes.Unimplemented, "method CreateTicket not implemented")
 }
-func (UnimplementedOpenMatchServiceServer) DeactivateTicket(context.Context, *DeactivateTicketRequest) (*DeactivateTicketResponse, error) {
-	return nil, status.Errorf(codes.Unimplemented, "method DeactivateTicket not implemented")
+func (UnimplementedOpenMatchServiceServer) DeactivateTickets(context.Context, *DeactivateTicketsRequest) (*DeactivateTicketsResponse, error) {
+	return nil, status.Errorf(codes.Unimplemented, "method DeactivateTickets not implemented")
 }
 func (UnimplementedOpenMatchServiceServer) ActivateTickets(context.Context, *ActivateTicketsRequest) (*ActivateTicketsResponse, error) {
 	return nil, status.Errorf(codes.Unimplemented, "method ActivateTickets not implemented")
@@ -318,20 +320,20 @@ func _OpenMatchService_CreateTicket_Handler(srv interface{}, ctx context.Context
 	return interceptor(ctx, in, info, handler)
 }
 
-func _OpenMatchService_DeactivateTicket_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
-	in := new(DeactivateTicketRequest)
+func _OpenMatchService_DeactivateTickets_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(DeactivateTicketsRequest)
 	if err := dec(in); err != nil {
 		return nil, err
 	}
 	if interceptor == nil {
-		return srv.(OpenMatchServiceServer).DeactivateTicket(ctx, in)
+		return srv.(OpenMatchServiceServer).DeactivateTickets(ctx, in)
 	}
 	info := &grpc.UnaryServerInfo{
 		Server:     srv,
-		FullMethod: OpenMatchService_DeactivateTicket_FullMethodName,
+		FullMethod: OpenMatchService_DeactivateTickets_FullMethodName,
 	}
 	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
-		return srv.(OpenMatchServiceServer).DeactivateTicket(ctx, req.(*DeactivateTicketRequest))
+		return srv.(OpenMatchServiceServer).DeactivateTickets(ctx, req.(*DeactivateTicketsRequest))
 	}
 	return interceptor(ctx, in, info, handler)
 }
@@ -426,8 +428,8 @@ var OpenMatchService_ServiceDesc = grpc.ServiceDesc{
 			Handler:    _OpenMatchService_CreateTicket_Handler,
 		},
 		{
-			MethodName: "DeactivateTicket",
-			Handler:    _OpenMatchService_DeactivateTicket_Handler,
+			MethodName: "DeactivateTickets",
+			Handler:    _OpenMatchService_DeactivateTickets_Handler,
 		},
 		{
 			MethodName: "ActivateTickets",
