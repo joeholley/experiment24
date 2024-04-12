@@ -16,7 +16,6 @@ package battleroyale
 
 import (
 	"fmt"
-	"log"
 	"time"
 
 	"github.com/sirupsen/logrus"
@@ -67,23 +66,15 @@ func (s *MmfServer) Run(stream pb.MatchMakingFunctionService_RunServer) error {
 	}
 	logger.Infof("Generating matches for profile %v", req.GetName())
 
-	// In this sample, don't distinguish between tickets in different pools -
-	// treat every ticket in every pool the same. However, since the same
-	// ticket can appear in multiple pools, start by adding tickets to a map
-	// (effectively creating a set), then copy the de-duplicated tickets to
-	// a slice since that's what the matchmaking algo wants to work on.
-	tickets := []*pb.Ticket{}
-	mapTickets := map[string]pb.Ticket{}
-	for pname, pool := range req.GetPools() {
-		log.Printf("Found %v tickets in pool %v", len(tickets), pname)
-		for _, ticket := range pool.GetParticipants().GetTickets() {
-			mapTickets[ticket.GetId()] = *ticket
-		}
-	}
+	// In this sample, the matchmaker passes an extension to this
+	// function to tell it which pool to use.
+	// TODO: read the extension
+	poolName := "competitive"
 
-	for _, ticket := range mapTickets {
-		tickets = append(tickets, &ticket)
-	}
+	// Get the pool this function uses when matching
+	tickets := []*pb.Ticket{}
+	tickets = req.GetPools()[poolName].GetParticipants().GetTickets()
+	logger.Infof("Found %v tickets in pool %v", len(tickets), poolName)
 
 	t := time.Now().Format("2006-01-02T15:04:05.00")
 	matchNum := 0

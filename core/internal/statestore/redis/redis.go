@@ -12,9 +12,9 @@ import (
 	"errors"
 	"fmt"
 	"strconv"
+	"strings"
 	"time"
 
-	"github.com/davecgh/go-spew/spew"
 	"github.com/gomodule/redigo/redis"
 	"github.com/sirupsen/logrus"
 	"github.com/spf13/viper"
@@ -97,14 +97,15 @@ func New(cfg *viper.Viper) *redisReplicator {
 // When using redis, these will be pipelined together as a batch update to improve performance.
 // In addition to the updates sent to the function, it always ends every batch with an XTRIM
 // command to delete all updates older than the ttl configured in the environment variable
-// OM_TICKET_TTL_SECS.
+// OM_CACHE_TICKET_TTL_SECS.
 func (rr *redisReplicator) SendUpdates(updates []*store.StateUpdate) []*store.StateResponse {
 	logger := logrus.WithFields(logrus.Fields{
 		"app":       "open_match",
 		"component": "redisReplicator.sendUpdates",
 	})
 
-	var rConn redis.Conn
+	var err error
+	rConn := rr.wConnPool.Get()
 	const redisCmd = "XADD"
 	out := make([]*store.StateResponse, len(updates))
 
@@ -140,6 +141,11 @@ func (rr *redisReplicator) SendUpdates(updates []*store.StateUpdate) []*store.St
 			redisArgs = append(redisArgs, update.Key)
 		case store.Assign:
 			// TODO: decide if we want multiple assignments in one redis record
+			// Right now, each entry in the Redis stream only hold one
+			// assignment. It is possible to put multiple assignments in a
+			// single entry (it is an arbitrary number of key/value pairs), but
+			// since assignments are deprecated we're pushing this optimization
+			// in order to focus on other things.
 			// Validate input
 			if update.Key == "" {
 				out[i].Err = errors.New("Missing ticket key")
@@ -159,17 +165,24 @@ func (rr *redisReplicator) SendUpdates(updates []*store.StateUpdate) []*store.St
 			continue
 		}
 
-		// Send command to redis
-		logger.Debugf("Executing redis command: %v %v", redisCmd, redisArgs)
-		rConn := rr.wConnPool.Get()
-		rConn.Send(redisCmd, redisArgs...)
+		// Send command to redis. Redigo functions need the args to be in
+		// []interface{} format, which is why we have the complicated String Print and
+		// TrimPrefix/Suffix calls when logging the command.
+		logger.Debugf("Executing redis command: %v %v", redisCmd,
+			strings.TrimPrefix(strings.TrimSuffix(fmt.Sprint(redisArgs), "]"), "["))
+		err = rConn.Send(redisCmd, redisArgs...)
+		if err != nil {
+			logger.Errorf("Redis error: %v", err)
+		}
 	}
 
 	// Append command to remove expired entries
-	expirationThresh := strconv.FormatInt(time.Now().Unix()-rr.cfg.GetInt64("OM_TICKET_TTL_SECS"), 10)
+	expirationThresh := strconv.FormatInt(time.Now().Unix()-rr.cfg.GetInt64("OM_CACHE_TICKET_TTL_SECS"), 10)
 	logger.Debugf("Executing redis command: XTRIM om-replication MINID %v", expirationThresh)
-	rConn.Send("XTRIM", "om-replication", "MINID", expirationThresh)
-	//sr.redisConn.Send("XTRIM", "om-replication", "MINID", "1707799344834-1")
+	err = rConn.Send("XTRIM", "om-replication", "MINID", expirationThresh)
+	if err != nil {
+		logger.Errorf("Redis error: %v", err)
+	}
 
 	// Send pipelined commands, get results
 	r, err := rConn.Do("")
@@ -179,38 +192,40 @@ func (rr *redisReplicator) SendUpdates(updates []*store.StateUpdate) []*store.St
 
 	// Last command we sent was the XTRIM above, so read all results but that final one into
 	// the array of strings to return from this function
-	for index := 0; index < len(r.([]interface{}))-1; index++ {
-		// First, make sure this was a valid update
-		if out[index].Err == nil {
-			t, err := redis.String(r.([]interface{})[index], err)
-			if err != nil {
-				out[index].Err = fmt.Errorf("Redis output string conversion error: %w", err)
-				t = ""
+	if r != nil { // Make sure we have results before we parse them
+		for index := 0; index < len(r.([]interface{}))-1; index++ {
+			// First, make sure this was a valid update
+			if out[index].Err == nil {
+				t, err := redis.String(r.([]interface{})[index], err)
+				if err != nil {
+					out[index].Err = fmt.Errorf("Redis output string conversion error: %w", err)
+					t = ""
+				}
+				out[index].Result = t
+				fmt.Printf(" %v - found string: %v\n", index, t)
+			} else {
+				// Error, the update didn't have all the required fields so it was never sent to redis.
+				// Return the error code, and the result is the key that generated the error.
+				fmt.Printf(" %v - had error\n", index)
+				out[index].Result = updates[index].Key
 			}
-			out[index].Result = t
-			fmt.Printf(" %v - found string: %v\n", index, t)
-		} else {
-			// Error, the update didn't have all the required fields so it was never sent to redis.
-			// Return the error code, and the result is the key that generated the error.
-			fmt.Printf(" %v - had error\n", index)
-			out[index].Result = updates[index].Key
 		}
-	}
 
-	// Last result from redis is a count of number of entries we removed with the XTRIM command.
-	expiredCount, err := redis.Int64(r.([]interface{})[len(r.([]interface{}))-1], err)
-	if err != nil {
-		logger.Errorf("Redis output int64 conversion error: %v", err)
-	}
-	if expiredCount > 0 {
-		logger.Debugf("Expired %v Redis entries due to configured OM_TICKET_TTL_SECS value of %v (expiration threshold timestamp %v)", expiredCount, rr.cfg.GetInt64("OM_TICKET_TTL_SECS"), expirationThresh)
+		// Last result from redis is a count of number of entries we removed with the XTRIM command.
+		expiredCount, err := redis.Int64(r.([]interface{})[len(r.([]interface{}))-1], err)
+		if err != nil {
+			logger.Errorf("Redis output int64 conversion error: %v", err)
+		}
+		if expiredCount > 0 {
+			logger.Debugf("Expired %v Redis entries due to configured OM_CACHE_TICKET_TTL_SECS value of %v (expiration threshold timestamp %v)", expiredCount, rr.cfg.GetInt64("OM_CACHE_TICKET_TTL_SECS"), expirationThresh)
+		}
 	}
 
 	return out
 }
 
 // getUpdates performs a blocking read on state (with a configurable timeout read from
-// the environment variable OM_REPLICATION_WAIT_TIMEOUT_MS) to receive
+// the environment variable OM_CACHE_IN_WAIT_TIMEOUT_MS) to receive
 // all update structs that have been sent to the replicator since the last getUpdates request.
 // They are returned in an array, and om-core is required to apply them
 // as events in the order they were originally received.
@@ -227,9 +242,9 @@ func (rr *redisReplicator) GetUpdates() []*store.StateUpdate {
 	redisCmd := "XREAD"
 	redisArgs := make([]interface{}, 0)
 	// Max num of updates to get in one go
-	redisArgs = append(redisArgs, "COUNT", rr.cfg.GetString("OM_REDIS_REPLICATION_MAX_UPDATES_PER_POLL"))
+	redisArgs = append(redisArgs, "COUNT", rr.cfg.GetString("OM_CACHE_IN_MAX_UPDATES_PER_POLL"))
 	// Timeout when waiting for stream updates
-	redisArgs = append(redisArgs, "BLOCK", rr.cfg.GetString("OM_REDIS_REPLICATION_WAIT_TIMEOUT_MS"))
+	redisArgs = append(redisArgs, "BLOCK", rr.cfg.GetString("OM_CACHE_IN_WAIT_TIMEOUT_MS"))
 	// Replication stream name
 	redisArgs = append(redisArgs, "STREAMS", "om-replication")
 	// Last ID read from this stream. Initialized to 0-0 (beginning of the stream) on startup.
@@ -241,49 +256,53 @@ func (rr *redisReplicator) GetUpdates() []*store.StateUpdate {
 	if err != nil {
 		logger.Errorf("Redis error: %v", err)
 	}
-	spew.Dump(data)
+	//spew.Dump(data)
 
 	// Redigo module returns nil for the data when it saw no update to the redis stream before the BLOCK
 	// timeout was reached. In that case, just return gracefully.
 	if data != nil {
-		// We're only using one stream for replication, so the
-		// data is down a couple of nested array levels in the response.
-		replStream := data.([]interface{})[0].([]interface{})[1].([]interface{})
-		for _, v := range replStream {
-			replId, err := redis.String(v.([]interface{})[0], nil)
-			if err != nil {
-				logger.Error(err)
-			}
-			thisUpdate := &store.StateUpdate{}
-			//fmt.Println(replId)
+		switch data.(type) {
+		case redis.Error:
+			logger.Errorf("Redis error: %v", data.(redis.Error))
+		case []interface{}:
+			// the data is down a couple of nested array levels in the response.
+			replStream := data.([]interface{})[0].([]interface{})[1].([]interface{})
+			for _, v := range replStream {
+				replId, err := redis.String(v.([]interface{})[0], nil)
+				if err != nil {
+					logger.Error(err)
+				}
+				thisUpdate := &store.StateUpdate{}
+				//fmt.Println(replId)
 
-			// Update type/key/value data
-			y, err := redis.Strings(v.([]interface{})[1], nil)
-			if err != nil {
-				logger.Error(err)
-			}
-			switch y[0] {
-			case "ticket":
-				thisUpdate.Cmd = store.Ticket
-				thisUpdate.Key = replId
-				thisUpdate.Value = y[1] // Only argument for a ticket is the ticket PB
-			case "activate":
-				thisUpdate.Cmd = store.Activate
-				thisUpdate.Key = y[1] // Only argument for a ticket activation is the ticket's ID
-			case "deactivate":
-				thisUpdate.Cmd = store.Deactivate
-				thisUpdate.Key = y[1] // Only argument for a ticket deactivation is the ticket's ID
-			case "assign":
-				thisUpdate.Cmd = store.Assign
-				thisUpdate.Key = y[1]   // ticket's ID
-				thisUpdate.Value = y[3] // assignment
-			}
+				// Update type/key/value data
+				y, err := redis.Strings(v.([]interface{})[1], nil)
+				if err != nil {
+					logger.Error(err)
+				}
+				switch y[0] {
+				case "ticket":
+					thisUpdate.Cmd = store.Ticket
+					thisUpdate.Key = replId
+					thisUpdate.Value = y[1] // Only argument for a ticket is the ticket PB
+				case "activate":
+					thisUpdate.Cmd = store.Activate
+					thisUpdate.Key = y[1] // Only argument for a ticket activation is the ticket's ID
+				case "deactivate":
+					thisUpdate.Cmd = store.Deactivate
+					thisUpdate.Key = y[1] // Only argument for a ticket deactivation is the ticket's ID
+				case "assign":
+					thisUpdate.Cmd = store.Assign
+					thisUpdate.Key = y[1]   // ticket's ID
+					thisUpdate.Value = y[3] // assignment
+				}
 
-			// Populated all the fields without an error
-			out = append(out, thisUpdate)
+				// Populated all the fields without an error
+				out = append(out, thisUpdate)
 
-			// update the current replId to indicate this update was processed
-			rr.replId = replId
+				// update the current replId to indicate this update was processed
+				rr.replId = replId
+			}
 		}
 	}
 	return out

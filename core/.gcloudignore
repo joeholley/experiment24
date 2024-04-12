@@ -8,7 +8,5 @@ bak
 *.zip
 protoc
 
-*.pb.go
-*.pb.gw.go
 *.swagger.json
 open-match.dev

@@ -1,4 +1,19 @@
+// Copyright 2024 Google LLC
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//	http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+//
 // Tries to use the guidelines at https://cloud.google.com/apis/design for the gRPC API where possible.
+//
 // TODO: permissive deadlines for all RPC calls
 package main
 
@@ -7,12 +22,16 @@ import (
 	"fmt"
 	"io"
 	"math"
+	"os"
+	"os/signal"
 	"regexp"
 	"strconv"
 	"strings"
 	"sync"
 	"time"
 
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/metric"
 	"google.golang.org/genproto/googleapis/rpc/errdetails"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
@@ -22,8 +41,8 @@ import (
 	"google.golang.org/protobuf/types/known/timestamppb"
 
 	"net/http"
-	_ "net/http"
-	_ "net/http/pprof"
+	_ "net/http"       // Debug
+	_ "net/http/pprof" // Debug
 
 	pb "open-match.dev/pkg/pb/v2"
 
@@ -33,6 +52,7 @@ import (
 	"github.com/spf13/viper"
 	"open-match.dev/core/internal/config"
 	"open-match.dev/core/internal/filter"
+	"open-match.dev/core/internal/statestore/cache"
 	store "open-match.dev/core/internal/statestore/datatypes"
 	memoryReplicator "open-match.dev/core/internal/statestore/memory"
 	redisReplicator "open-match.dev/core/internal/statestore/redis"
@@ -49,58 +69,40 @@ var (
 		"component": "core",
 	})
 	cfg *viper.Viper = nil
+
+	// One global instance for the local ticket cache. Everything reads and
+	// writes to this one instance which contains concurrent-safe data
+	// structures where necessary.
+	tc cache.ReplicatedTicketCache
 )
 
-// cacheUpdateRequest is basically a wrapper around a store.StateUpdate. The state storage
-// layer shouldn't need to understand the underlying context, or where the update
-// request originated (which is where it will return). These are necessary for the
-// gRPC server in om-core, however!
-type cacheUpdateRequest struct {
-	// Context, so this request can be cancelled
-	ctx context.Context
-	// The update itself.
-	update store.StateUpdate
-	// Return channel to confirm the write by sending back the assigned ticket ID
-	resultsChan chan *store.StateResponse
-}
-
-// The server instantiates a replicatedTicketCache on startup, and all
-// ticket-reading functionality reads from this local cache. The cache also has
-// the necessary data structures for replicating ticket cache changes that come
-// in to this instance by it handling gRPC calls.
-type replicatedTicketCache struct {
-	// Local copies of all the state data.
-	tickets     sync.Map
-	inactiveSet sync.Map
-	assignments sync.Map
-
-	// How this replicatedTicketCache is replicated.
-	replicator store.StateReplicator
-	// The queue of cache updates
-	upRequests chan *cacheUpdateRequest
-}
-
-// One global instance for the local ticket cache. Everything
-// reads and writes to this one instance using concurrent-safe
-// data structures where necessary.
-var tc replicatedTicketCache
-
 func main() {
+
+	// DEBUG serve the http/pprof module debug endpoint
 	go func() {
 		logger.Print(http.ListenAndServe("localhost:2224", nil))
 	}()
 
 	// Read configuration env vars, and configure logging
 	cfg = config.Read()
-	ctx := context.Background()
+
+	// Make a parent context that gets cancelled on SIGINT
+	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt)
+	defer cancel()
+
+	// Configure metrics
+	meter := initializeOtel()
+	registerMetrics(meter)
+	cache.RegisterMetrics(meter)
 
 	// Set up the replicated ticket cache.
 	// fields using sync.Map come ready to use and don't need initialization
-	tc.upRequests = make(chan *cacheUpdateRequest)
+	tc.Cfg = cfg
+	tc.UpRequests = make(chan *cache.UpdateRequest)
 	switch cfg.GetString("OM_STATE_STORAGE_TYPE") {
 	case "redis":
 		// Default: use redis
-		tc.replicator = redisReplicator.New(cfg)
+		tc.Replicator = redisReplicator.New(cfg)
 	case "memory":
 		// use local memory
 		// NOT RECOMMENDED FOR PRODUCTION
@@ -110,12 +112,12 @@ func main() {
 		// any updates to/from any other instances.
 		// Useful for debugging, local development, etc.
 		logger.Warnf("OM_STATE_STORAGE_TYPE configuration variable set to 'memory'. NOT RECOMMENDED FOR PRODUCTION")
-		tc.replicator = memoryReplicator.New(cfg)
+		tc.Replicator = memoryReplicator.New(cfg)
 	}
 
 	// These goroutines send and receive cache updates from state storage
-	go incomingReplicationQueue(ctx, &tc)
-	go outgoingReplicationQueue(ctx, &tc)
+	go tc.OutgoingReplicationQueue(ctx)
+	go tc.IncomingReplicationQueue(ctx)
 
 	// Start the gRPC server
 	start(cfg)
@@ -123,289 +125,13 @@ func main() {
 	// TODO remove for RC
 	// Dump the final state of the cache to the log for debugging.
 	if cfg.GetBool("OM_VERBOSE") {
-		spew.Dump(dump(&tc.tickets))
-		spew.Dump(dump(&tc.inactiveSet))
-		spew.Dump(dump(&tc.assignments))
+		spew.Dump(syncMapDump(&tc.Tickets))
+		spew.Dump(syncMapDump(&tc.InactiveSet))
+		spew.Dump(syncMapDump(&tc.Assignments))
 	}
 	logger.Info("Application stopped successfully.")
-	logger.Infof("Final state of local cache: %v tickets, %v active, %v inactive, %v assignments", len(dump(&tc.tickets)), len(setDifference(&tc.tickets, &tc.inactiveSet)), len(dump(&tc.inactiveSet)), len(dump(&tc.assignments)))
+	logger.Infof("Final state of local cache: %v tickets, %v active, %v inactive, %v assignments", len(syncMapDump(&tc.Tickets)), len(setDifference(&tc.Tickets, &tc.InactiveSet)), len(syncMapDump(&tc.InactiveSet)), len(syncMapDump(&tc.Assignments)))
 
-}
-
-// outgoingReplicationQueue is an asynchronous goroutine that runs for the
-// lifetime of the server.  It processes incoming repliation events that are
-// produced by gRPC handlers, and sends those events to the configured state
-// storage. The updates aren't applied to the local copy of the ticket cache
-// yet at this point; once the event has been successfully replicated and
-// received in the incomingReplicationQueue goroutine, the update is applied to
-// the local cache.
-func outgoingReplicationQueue(ctx context.Context, tc *replicatedTicketCache) {
-	logger := logrus.WithFields(logrus.Fields{
-		"app":       "open_match",
-		"component": "replicationQueue",
-		"direction": "outgoing",
-	})
-
-	logger.Debug(" Listening for replication requests")
-	exec := false
-	redisPipelineRequests := make([]*cacheUpdateRequest, 0)
-	redisPipeline := make([]*store.StateUpdate, 0)
-
-	for {
-		// initialize variables for this loop
-		exec = false
-		redisPipelineRequests = redisPipelineRequests[:0]
-		redisPipeline = redisPipeline[:0]
-		timeout := time.After(time.Millisecond * time.Duration(cfg.GetInt("OM_REDIS_PIPELINE_WAIT_TIMEOUT_MS")))
-
-		// collect currently pending requests to write to redis using a pipeline command
-		for exec != true {
-			select {
-			case req := <-tc.upRequests:
-				redisPipelineRequests = append(redisPipelineRequests, req)
-				redisPipeline = append(redisPipeline, &req.update)
-
-				//logger.Debugf(" %v requests queued for current batch", len(redisPipelineRequests))
-				if len(redisPipelineRequests) >= cfg.GetInt("OM_REDIS_PIPELINE_MAX_QUEUE_THRESHOLD") {
-					// Maximum batch size reached
-					logger.Debug("OM_REDIS_PIPELINE_MAX_QUEUE_THRESHOLD reached")
-					exec = true
-				}
-
-			case <-timeout:
-				// Timeout reached, don't wait for the batch to be full.
-				logger.Debug("OM_REDIS_PIPELINE_WAIT_TIMEOUT_MS reached")
-				exec = true
-			}
-		}
-
-		// If the redis update pipeline batch job has commands to run, execute
-		if len(redisPipelineRequests) > 0 {
-			// TODO: some kind of defered-goroutine-something that handles context cancellation
-			logger.Debug("executing batch")
-			results := tc.replicator.SendUpdates(redisPipeline)
-			logger.Debug(" got results")
-
-			for index, result := range results {
-				// send back this result to it's unique return channel
-				redisPipelineRequests[index].resultsChan <- result
-			}
-		}
-	}
-}
-
-// incomingReplicationQueue is an asynchronous goroutine that runs for the
-// lifetime of the server. It reads all incoming replication events from the
-// configured state storage and applies them to the local ticket cache.  In
-// practice, this does almost all the work for every om-core gRPC handler
-// /except/ InvokeMatchMakingFunction.
-func incomingReplicationQueue(ctx context.Context, tc *replicatedTicketCache) {
-
-	logger := logrus.WithFields(logrus.Fields{
-		"app":       "open_match",
-		"component": "replicationQueue",
-		"direction": "incoming",
-	})
-
-	// Listen to the replication streams in Redis asynchronously,
-	// and add updates to the channel to be processed as they come in
-	replStream := make(chan store.StateUpdate, cfg.GetInt("OM_REDIS_REPLICATION_MAX_UPDATES_PER_POLL"))
-	go func() {
-		for {
-			// The getUpdates() function blocks if there are no updates, but it respects
-			// the timeout defined in the config environment variable OM_REDIS_REPLICATION_WAIT_TIMEOUT_MS
-			results := tc.replicator.GetUpdates()
-			for _, curUpdate := range results {
-				replStream <- *curUpdate
-			}
-		}
-	}()
-
-	// Check the channel for updates, and apply them
-	for {
-		// Force sleep time between applying replication updates into the local cache
-		// to avoid tight looping and high cpu usage.
-		time.Sleep(time.Millisecond * time.Duration(cfg.GetInt("OM_REDIS_REPLICATION_WAIT_TIMEOUT_MS")))
-		done := false
-
-		for !done {
-			// Maximum length of time we can process updates access to the
-			// ticket cache is locked during updates, so we need a hard limit here.
-			updateTimeout := time.After(time.Millisecond * 500)
-
-			// Process all incoming updates (up to the maximum defined in the
-			// config var OM_REDIS_REPLICATION_WAIT_TIMEOUT_MS), up until there
-			// are none left or the lock timeout is reached.
-			select {
-			case curUpdate := <-replStream:
-				// Still updates to process.
-				switch curUpdate.Cmd {
-				case store.Ticket:
-					// Convert the update value back to a protobuf message for
-					// storage.
-					//
-					// https://protobuf.dev/programming-guides/api/#use-different-messages
-					// states that this is not a preferred pattern, but om-core
-					// meets the criteria to be an exception:
-					// "If all of the following are true:
-					//
-					// - your service is the storage system
-					// - your system doesn't make decisions based on your
-					//   clients' structured data
-					// - your system simply stores, loads, and perhaps provides
-					//   queries at your client's request"
-					ticketPb := &pb.Ticket{}
-					proto.Unmarshal([]byte(curUpdate.Value), ticketPb)
-
-					// Set TicketID. Must do it post-replication since
-					// TicketID /is/ the Replication ID
-					// (e.g. redis stream entry id)
-					// This guarantees that the client can never get an
-					// invalid ticketID that was not successfully stored/replicated
-					ticketPb.Id = curUpdate.Key
-
-					// All tickets begin inactive
-					tc.inactiveSet.Store(curUpdate.Key, true)
-					tc.tickets.Store(curUpdate.Key, ticketPb)
-					logger.Debugf("ticket replication received: %v", curUpdate.Key)
-
-				case store.Activate:
-					tc.inactiveSet.Delete(curUpdate.Key)
-					logger.Debugf("activation replication received: %v", curUpdate.Key)
-
-				case store.Deactivate:
-					tc.inactiveSet.Store(curUpdate.Key, true)
-					logger.Debugf("deactivate replication received: %v", curUpdate.Key)
-
-				case store.Assign:
-					// Convert the assignment back into a protobuf message.
-					assignmentPb := &pb.Assignment{}
-					proto.Unmarshal([]byte(curUpdate.Value), assignmentPb)
-					tc.assignments.Store(curUpdate.Key, assignmentPb)
-					logger.Debugf("**DEPRECATED** assign replication received %v:%v", curUpdate.Key, assignmentPb.GetConnection())
-				}
-			case <-updateTimeout:
-				// Lock hold timeout exceeded
-				logger.Debug("lock hold timeout")
-				done = true
-			default:
-				// Nothing left to process; exit immediately
-				logger.Debug("Incoming update queue empty")
-				done = true
-			}
-		}
-
-		// Expiration closure, contains all code that removes data from the
-		// replicated ticket cache.
-		//
-		// No need for this to be it's own function yet as the performance is
-		// satisfactory running it immediately after every cache update.
-		//
-		// Removal logic is as follows:
-		// * ticket ids expired from the inactive list MUST also have their
-		//   tickets removed from the ticket cache! Any ticket that exists and
-		//   doesn't have it's id on the inactive list is considered active and
-		//   will appear in ticket pools for invoked MMFs!
-		// * tickets with user-specified expiration times sooner than the
-		//   default MUST be removed from the cache at the user-specified time.
-		//   Inactive list is not affected by this as inactive list entries for
-		//   tickets that don't exist have no effect (except briefly taking up a
-		//   few bytes of memory). Dangling inactive list entries will be cleaned
-		//   up in expirations cycles after the configured OM ticket TTL anyway.
-		// * assignments are expired after the configured OM ticket TTL AND the
-		//   configured OM assignment TTL have elapsed. This is to handle cases
-		//   where tickets expire after they were passed to invoked MMFs but
-		//   before they are in sessions. Such tickets are still allowed to be
-		//   assigned  and their assigments will be retained until the
-		//   expiration time described above. **DEPRECATED**
-		//
-		// TODO: measure the impact of expiration operations with a timer
-		// metric under extreme load, and if it's problematic,
-		// revisit / possibly do it asynchronously
-		//
-		// Ticket IDs are assigned by Redis in the format of
-		// <unix_timestamp>-<index> where the index increments every time a
-		// ticket is created during the same second. We are only
-		// interested in the ticket creation time (the unix timestamp) here.
-		//
-		// The in-memory replication module just follows the redis
-		// convention so this works fine, but this would need to be
-		// abstracted into a method of the stateReplicator interface if
-		// we ever support a different replication layer (for example,
-		// pub/sub).
-		{
-			exLogger := logrus.WithFields(logrus.Fields{
-				"app":       "open_match",
-				"component": "replicatedTicketCache",
-				"operation": "expiration",
-			})
-			numInactiveSetDeletions := 0
-			numTicketDeletions := 0
-			numAssignmentDeletions := 0
-
-			// cull expired tickets from the local cache inactive ticket set
-			tc.inactiveSet.Range(func(id, _ any) bool {
-				// Get creation timestamp from ID
-				ticketCreationTime, err := strconv.ParseInt(strings.Split(id.(string), "-")[0], 10, 64)
-				if err != nil {
-					exLogger.Error("Unable to parse ticket ID into an unix timestamp when trying to expire old assignments")
-				}
-				if (time.Now().Unix() - ticketCreationTime) > int64(cfg.GetInt("OM_TICKET_TTL_SECS")) {
-					// Ensure that when expiring a ticket from the inactive set, the ticket is always deleted as well.
-					_, existed := tc.tickets.LoadAndDelete(id)
-					if existed {
-						numTicketDeletions++
-					}
-
-					// Remove expired ticket from the inactive set.
-					tc.inactiveSet.Delete(id)
-					numInactiveSetDeletions++
-				}
-				return true
-			})
-
-			// cull expired tickets from local cache
-			tc.tickets.Range(func(id, ticket any) bool {
-				if time.Now().After(ticket.(*pb.Ticket).GetExpirationTime().AsTime()) {
-					tc.tickets.Delete(id)
-					numTicketDeletions++
-				}
-				return true
-			})
-
-			// cull expired assignments from local cache
-			tc.assignments.Range(func(id, _ any) bool {
-				// Get creation timestamp from ID
-				ticketCreationTime, err := strconv.ParseInt(strings.Split(id.(string), "-")[0], 10, 64)
-				if err != nil {
-					exLogger.Error("Unable to parse ticket ID into an unix timestamp when trying to expire old assignments")
-				}
-				if (time.Now().Unix() - ticketCreationTime) >
-					int64(cfg.GetInt("OM_TICKET_TTL_SECS")+cfg.GetInt("OM_ASSIGNMENT_TTL_SECS")) {
-					tc.assignments.Delete(id)
-					numAssignmentDeletions++
-				}
-				return true
-			})
-
-			if numAssignmentDeletions > 0 {
-				exLogger.Infof("Removed %v expired assignments from local cache", numAssignmentDeletions)
-			} else {
-				exLogger.Debug("No expired assignments to remove from cache this cycle")
-			}
-			if numInactiveSetDeletions > 0 {
-				exLogger.Infof("%v ticket ids expired from the inactive list in local cache", numInactiveSetDeletions)
-			} else {
-				exLogger.Debug("No ticket ids to remove from the cache inactive list this cycle")
-			}
-			if numTicketDeletions > 0 {
-				exLogger.Infof("Removed %v expired tickets from local cache", numTicketDeletions)
-			} else {
-				exLogger.Debug("No expired tickets to remove from cache this cycle")
-			}
-		}
-
-	}
 }
 
 // CreateTicket generates an event to update the ticket state storage, adding a
@@ -416,11 +142,9 @@ func incomingReplicationQueue(ctx context.Context, tc *replicatedTicketCache) {
 // was not successfully replicated and returned to the om-core client is ever
 // put in the pool.
 func (s *grpcServer) CreateTicket(parentCtx context.Context, req *pb.CreateTicketRequest) (*pb.CreateTicketResponse, error) {
-
-	logger := logrus.WithFields(logrus.Fields{
-		"app":       "open_match",
-		"component": "core",
-		"rpc":       "CreateTicket",
+	logger := logger.WithFields(logrus.Fields{
+		"stage": "handling",
+		"rpc":   "CreateTicket",
 	})
 
 	// Input validation
@@ -443,12 +167,14 @@ func (s *grpcServer) CreateTicket(parentCtx context.Context, req *pb.CreateTicke
 
 	// The default expiration time is based on the provided creation time
 	// (which defaults to now) + the configured ticket TTL
-	defaultExTime := crTime.AsTime().Add(time.Second * time.Duration(cfg.GetInt("OM_TICKET_TTL_SECS")))
+	defaultExTime := crTime.AsTime().Add(time.Second * time.Duration(cfg.GetInt("OM_CACHE_TICKET_TTL_SECS")))
 
-	// Set expiration timestamp if request didn't provide a valid one
+	// Set expiration timestamp if request didn't provide a valid one.
+	// Matchmakers can request a shorter expiration time than the default, but
+	// not a longer one.
 	if !exTime.IsValid() ||
 		exTime.AsTime().After(defaultExTime) {
-		logger.Debugf("ExpirationTime provided is invalid or nil; replacing with current time + OM_TICKET_TTL_SECS (%v)", cfg.GetInt("OM_TICKET_TTL_SECS"))
+		logger.Debugf("ExpirationTime provided is invalid or nil; replacing with current time + OM_CACHE_TICKET_TTL_SECS (%v)", cfg.GetInt("OM_CACHE_TICKET_TTL_SECS"))
 		exTime = timestamppb.New(defaultExTime)
 	}
 
@@ -476,17 +202,18 @@ func (s *grpcServer) CreateTicket(parentCtx context.Context, req *pb.CreateTicke
 
 	// Queue our ticket creation cache update request to be replicated to all
 	// om-core instances.
-	tc.upRequests <- &cacheUpdateRequest{
-		// Writing this ticket to state storage (redis by default) can be
-		// pipelined by the implementing module for better performance under
-		// high rps. The batch writing async goroutine
-		// outgoingReplicationQueue() handles writing to state storage.
-		update: store.StateUpdate{
+	tc.UpRequests <- &cache.UpdateRequest{
+		// This command (writing a ticket to the cache)
+		// is replicated to all other om-core instances using the batch
+		// writing async goroutine tc.OutgoingReplicationQueue() and its
+		// effect is applied to the local ticket cache in the update
+		// processing async goroutine tc.IncomingReplicationQueue().
+		ResultsChan: rChan,
+		Ctx:         parentCtx,
+		Update: store.StateUpdate{
 			Cmd:   store.Ticket,
 			Value: string(ticketPb[:]),
 		},
-		resultsChan: rChan,
-		ctx:         parentCtx,
 	}
 
 	// Get the results
@@ -495,35 +222,65 @@ func (s *grpcServer) CreateTicket(parentCtx context.Context, req *pb.CreateTicke
 	return &pb.CreateTicketResponse{TicketId: results.Result}, results.Err
 }
 
-// DeactivatesTicket is a lazy deletion process: it adds the provided ticketIDs to the inactive list,
-// which prevents them from appearing in player pools, and the tickets are deleted when they expire.
-func (s *grpcServer) DeactivateTickets(parentCtx context.Context, req *pb.DeactivateTicketsRequest) (*pb.DeactivateTicketsResponse, error) {
+// updateTicketsActiveState accepts a list of ticketids to (de-)activate, and
+// generates cache updates for each.
+//
+// NOTE This function does no input validation, that responsibility falls on the
+// calling function.
+func updateTicketsActiveState(parentCtx context.Context, ticketIds []string, command int) map[string]error {
+	logger := logger.WithFields(logrus.Fields{
+		"stage": "handling",
+		"rpc":   "updateTicketsActiveState",
+	})
 
-	// Validate number of requested updates
-	numReqUpdates := len(req.GetTicketIds())
-	if numReqUpdates == 0 {
-		err := status.Error(codes.InvalidArgument, "No Ticket IDs in update request")
-		return nil, err
+	errs := map[string]error{}
+
+	rChan := make(chan *store.StateResponse, len(ticketIds))
+	defer close(rChan)
+
+	// Make a human-readable version of the requested state transition, for
+	// logging
+	requestedStateAsString := ""
+	switch command {
+	case store.Deactivate:
+		requestedStateAsString = "inactive"
+	case store.Activate:
+		requestedStateAsString = "active"
 	}
-	if numReqUpdates > cfg.GetInt("OM_MAX_STATE_UPDATES_PER_CALL") {
-		errMsg := fmt.Sprintf("Too many ticket state updates requested in a single call (configured maximum %v, requested %v)",
-			cfg.GetInt("OM_MAX_STATE_UPDATES_PER_CALL"), numReqUpdates)
-		err := status.Error(codes.InvalidArgument, errMsg)
-		return nil, err
+
+	numUpdates := 0
+	for _, id := range ticketIds {
+		logger.WithFields(logrus.Fields{
+			"new_state": requestedStateAsString,
+		}).Debugf("update ticket status request id: %v", id)
+		tc.UpRequests <- &cache.UpdateRequest{
+			// This command (adding/removing the id to the inactive list)
+			// is replicated to all other om-core instances using the batch
+			// writing async goroutine tc.OutgoingReplicationQueue() and its
+			// effect is applied to the local ticket cache in the update
+			// processing async goroutine tc.IncomingReplicationQueue().
+			ResultsChan: rChan,
+			Ctx:         parentCtx,
+			Update: store.StateUpdate{
+				Cmd: command,
+				Key: id,
+			},
+		}
+		numUpdates++
 	}
-	// Validate input against state storage event id format
-	validTicketIds, invalidTicketIds := validateTicketIds(req.GetTicketIds())
 
-	// Send the ticket deactivation updates. Returns the last Replication ID of
-	// the batch. Can be used to determine if all of these activations have
-	// been applied to a given om-core instance.
-	errs := updateTicketsActiveState(parentCtx, validTicketIds, store.Deactivate)
+	// look through all results for errors
+	for i := 0; i < len(ticketIds); i++ {
+		results := <-rChan
 
-	// Add deactivation failures to the error details
-	_ = invalidTicketIds
-	err := addStateUpdateErrorDetails(errs)
-
-	return &pb.DeactivateTicketsResponse{}, err
+		if results.Err != nil {
+			// Wrap redis error and give it a gRPC internal server error status code
+			// The results.result field contains the ticket id that generated the error.
+			errs[results.Result] = fmt.Errorf("Unable to update ticket %v state to %v : %w", ticketIds[i], requestedStateAsString, results.Err)
+			logger.Error(errs[results.Result])
+		}
+	}
+	return errs
 }
 
 // ActivateTickets accepts a list of ticketids to activate, validates the
@@ -537,7 +294,7 @@ func (s *grpcServer) ActivateTickets(parentCtx context.Context, req *pb.Activate
 		return nil, err
 	}
 	if numReqUpdates > cfg.GetInt("OM_MAX_STATE_UPDATES_PER_CALL") {
-		errMsg := fmt.Sprintf("Too many ticket state updates requested in a single call (configured maximum %v, requested %v)",
+		errMsg := fmt.Sprintf("Too many ticket activations requested in a single call (configured maximum %v, requested %v)",
 			cfg.GetInt("OM_MAX_STATE_UPDATES_PER_CALL"), numReqUpdates)
 		err := status.Error(codes.InvalidArgument, errMsg)
 		return nil, err
@@ -555,22 +312,58 @@ func (s *grpcServer) ActivateTickets(parentCtx context.Context, req *pb.Activate
 	_ = invalidTicketIds
 	err := addStateUpdateErrorDetails(errs)
 
+	// Record metrics
+	ActivationsPerCall.Record(parentCtx, int64(len(validTicketIds)))
+
 	return &pb.ActivateTicketsResponse{}, err
+}
+
+// DeactivatesTicket is a lazy deletion process: it adds the provided ticketIDs to the inactive list,
+// which prevents them from appearing in player pools, and the tickets are deleted when they expire.
+func (s *grpcServer) DeactivateTickets(parentCtx context.Context, req *pb.DeactivateTicketsRequest) (*pb.DeactivateTicketsResponse, error) {
+
+	// Validate number of requested updates
+	numReqUpdates := len(req.GetTicketIds())
+	if numReqUpdates == 0 {
+		err := status.Error(codes.InvalidArgument, "No Ticket IDs in update request")
+		return nil, err
+	}
+	if numReqUpdates > cfg.GetInt("OM_MAX_STATE_UPDATES_PER_CALL") {
+		errMsg := fmt.Sprintf("Too many ticket deactivations requested in a single call (configured maximum %v, requested %v)",
+			cfg.GetInt("OM_MAX_STATE_UPDATES_PER_CALL"), numReqUpdates)
+		err := status.Error(codes.InvalidArgument, errMsg)
+		return nil, err
+	}
+	// Validate input against state storage event id format
+	validTicketIds, invalidTicketIds := validateTicketIds(req.GetTicketIds())
+
+	// Send the ticket deactivation updates. Returns the last Replication ID of
+	// the batch. Can be used to determine if all of these activations have
+	// been applied to a given om-core instance.
+	errs := updateTicketsActiveState(parentCtx, validTicketIds, store.Deactivate)
+
+	// Add deactivation failures to the error details
+	_ = invalidTicketIds
+	err := addStateUpdateErrorDetails(errs)
+
+	// Record metrics
+	DeactivationsPerCall.Record(parentCtx, int64(len(validTicketIds)))
+
+	return &pb.DeactivateTicketsResponse{}, err
 }
 
 // InvokeMatchmakingFunctions loops through each Pool in the provided Profile,
 // applying the filters inside and adding participating tickets to those pools.
 // It then attempts to connect to every matchmaking function in the provided
-// list, and send that Profile with filled Pools to each. It then aggregates
-// all the resulting streams into a channel on which it can return results from
-// each matchmaking function asynchronously.
-// TODO: audit context https://stackoverflow.com/questions/76724124/does-a-go-grpc-server-streaming-method-not-have-a-context-argument
+// list, and send the Profile with filled Pools to each. It processes resulting
+// matches from each matchmaking function asynchronously as they arrive. For
+// each match it receives, it deactivates all tickets contained in the match
+// and streams the match back to the InvokeMatchmakingFunctions caller.
+//
+// TODO: audit context/cancellation
+//
+//	https://stackoverflow.com/questions/76724124/does-a-go-grpc-server-streaming-method-not-have-a-context-argument
 func (s *grpcServer) InvokeMatchmakingFunctions(req *pb.MmfRequest, stream pb.OpenMatchService_InvokeMatchmakingFunctionsServer) error {
-	logger := logrus.WithFields(logrus.Fields{
-		"app":       "open_match",
-		"component": "core",
-		"rpc":       "InvokeMatchmakingFunctions",
-	})
 
 	// input validation
 	if req.GetProfile() == nil {
@@ -579,6 +372,12 @@ func (s *grpcServer) InvokeMatchmakingFunctions(req *pb.MmfRequest, stream pb.Op
 	if req.GetMmfs() == nil {
 		return status.Error(codes.InvalidArgument, "list of mmfs to invoke is required")
 	}
+
+	logger := logger.WithFields(logrus.Fields{
+		"stage":        "handling",
+		"rpc":          "InvokeMatchmakingFunctions",
+		"profile_name": req.GetProfile().GetName(),
+	})
 
 	// Apply filters from all pools specified in this profile
 	// to find the participating tickets for each pool.  Start by snapshotting
@@ -589,27 +388,13 @@ func (s *grpcServer) InvokeMatchmakingFunctions(req *pb.MmfRequest, stream pb.Op
 	// the ticket cache that happen after this point.
 
 	// Copy the ticket cache, leaving out inactive tickets.
-	pactiveTickets := make([]*pb.Ticket, 0)
-	tc.tickets.Range(func(id, ticket any) bool {
-		// not ok means an error was encountered, indicating this
-		// ticket is NOT inactive (meaning it IS active)
-		pactiveTickets = append(pactiveTickets, ticket.(*pb.Ticket))
-		return true
-	})
-	inactiveTickets := make([]string, 0)
-	tc.inactiveSet.Range(func(id, _ any) bool {
-		// not ok means an error was encountered, indicating this
-		// ticket is NOT inactive (meaning it IS active)
-		inactiveTickets = append(inactiveTickets, id.(string))
-		return true
-	})
+	activeTickets := setDifference(&tc.Tickets, &tc.InactiveSet)
+	// TODO: this is just for metrics, move to a proper metric counter var instead
+	unassignedTickets := setDifference(&tc.InactiveSet, &tc.Assignments)
 
-	activeTickets := setDifference(&tc.tickets, &tc.inactiveSet)
-	unassignedTickets := setDifference(&tc.inactiveSet, &tc.assignments)
-
-	logger.Infof(" %5d/%5d tickets active, %5d/%5d tickets inactive without assignments",
-		len(activeTickets), len(pactiveTickets), len(unassignedTickets), len(inactiveTickets))
-	logger.Debugf("Ticket cache contains %v active tickets to filter into pools for profile %v", len(activeTickets), req.GetProfile().GetName())
+	logger.Infof(" %5d tickets active, %5d tickets inactive without assignment",
+		len(activeTickets), len(unassignedTickets))
+	logger.Debugf("Ticket cache contains %v active tickets to filter into pools", len(activeTickets))
 
 	// validate pool filters before filling them
 	validPools := map[string][]*pb.Ticket{}
@@ -621,19 +406,26 @@ func (s *grpcServer) InvokeMatchmakingFunctions(req *pb.MmfRequest, stream pb.Op
 			logger.Error("Unable to fill pool with tickets, invalid: %w", err)
 		}
 	}
+	logger.Debugf("Tickets filtered into %v pools", len(validPools))
 
-	// Perform filtering, and 'chunk' the pools into slightly smaller 4mb pieces to stream
-	// 4mb is default max pb size.
-	// 1000 for a little extra headroom, we're not trying to hyper-optimize here
+	// Perform filtering, and 'chunk' the pools into 4mb pieces for streaming
+	// (4mb is default max pb size.)
+	// 1000 instead of 1024 for a little extra headroom, we're not trying to hyper-optimize here
+	// Every chunk contains the entire profile, and a portion of the tickets in that profile's pools.
 	maxPbSize := 4 * 1000 * 1000
-	chunkedPools := make([]map[string][]*pb.Ticket, 0)
-	chunkedPools = append(chunkedPools, map[string][]*pb.Ticket{})
-	var chunkCount int32
+	// Figure out how big the message is with the profile populated, but all pools empty
 	emptyChunkSize := proto.Size(&pb.ChunkedMmfRunRequest{Profile: req.GetProfile(), NumChunks: math.MaxInt32})
 	curChunkSize := emptyChunkSize
+
+	// Array of 'chunks', each consisting of a portion of the pools in this profile.
+	// MMFs need to re-assemble the pools with a simple loop+concat over all chunks
+	var chunkCount int32
+	chunkedPools := make([]map[string][]*pb.Ticket, 0)
+	chunkedPools = append(chunkedPools, map[string][]*pb.Ticket{})
+
 	for _, ticket := range activeTickets {
 		for name, _ := range validPools {
-			// All the hard work for this is in internal/filter/filter.go
+			// All the implementation details of filtering are in internal/filter/filter.go
 			if filter.In(req.GetProfile().GetPools()[name], ticket.(*pb.Ticket)) {
 				ticketSize := proto.Size(ticket.(*pb.Ticket))
 				// Check if this ticket will put us over the max pb size for this chunk
@@ -645,10 +437,10 @@ func (s *grpcServer) InvokeMatchmakingFunctions(req *pb.MmfRequest, stream pb.Op
 				}
 				chunkedPools[chunkCount][name] = append(chunkedPools[chunkCount][name], ticket.(*pb.Ticket))
 				curChunkSize += ticketSize
-				//validPools[name] = append(validPools[name], ticket.(*pb.Ticket))
 			}
 		}
 	}
+	logger.Debugf("%v pools split into %v chunks", len(validPools), len(chunkedPools))
 
 	// put final participant rosters into the pools.
 	// Send the full profile in each streamed 'chunk', only the pools are broken
@@ -677,28 +469,27 @@ func (s *grpcServer) InvokeMatchmakingFunctions(req *pb.MmfRequest, stream pb.Op
 			Profile:   profile,
 			NumChunks: int32(len(chunkedPools)),
 		}
-
 	}
 
-	// TODO: cache connections using a pool and re-use
-	var opts []grpc.DialOption
-	opts = append(opts, grpc.WithTransportCredentials(insecure.NewCredentials()))
-	// opts = append(opts, grpc.WithConnectParams(grpc.ConnectParams{MinConnectTimeout: (time.Second * 5)}))
-
+	// MMF Result fan-in goroutine
 	// Simple fan-in channel pattern implemented as an async inline goroutine.
 	// Asynchronously sends matches to InvokeMatchMakingFunction() caller as
 	// they come in from the concurrently-running MMFs. Exits when all
 	// MMFs are complete.
-	// TODO: add a configurable timeout for long-running MMFs
+
+	// Channel on which MMFs return their matches.
 	matchChan := make(chan *pb.Match)
+	// Channel that receives a bool flag when all MMFs have closed their streams.
 	waitChan := make(chan bool)
 	var mmfwg sync.WaitGroup
 	go func() {
-		logger.Debug("Results Fan-in goroutine active")
+		logger.Debug("MMF results fan-in goroutine active")
 		for {
 			select {
 			case match := <-matchChan:
-				logger.Debugf("Streaming back match %v", match.GetId())
+				logger.WithFields(logrus.Fields{
+					"match_id": match.GetId(),
+				}).Debug("streaming back match")
 				stream.Send(&pb.StreamedMmfResponse{Match: match})
 			case <-waitChan:
 				logger.Debug("ALL MMFS COMPLETE")
@@ -708,45 +499,68 @@ func (s *grpcServer) InvokeMatchmakingFunctions(req *pb.MmfRequest, stream pb.Op
 		}
 	}()
 
+	// Set up grpc dial options for all MMFs
+	// Generally, we want to allow long-running MMFs to continue until they
+	// finish processing; but best practice dictates /some/ timeout here
+	// (default 10 mins).
+	var opts []grpc.DialOption
+	mmfTimeout := time.Duration(cfg.GetInt("OM_MMF_TIMEOUT_SECS")) * time.Second
+	opts = append(opts,
+		grpc.WithConnectParams(grpc.ConnectParams{MinConnectTimeout: mmfTimeout}),
+		grpc.WithTransportCredentials(insecure.NewCredentials()),
+	)
+
 	// Invoke each requested MMF, and put the matches they stream back into the match channel.
 	for _, mmf := range req.GetMmfs() {
 		// Add this invocation to the MMF wait group.
+		// TODO: Change to an errorgroup
 		mmfwg.Add(1)
-		//TODO: Needs to be an errorgroup
+
+		// MMF fan-out goroutine
+		// Call the MMF asynchronously, so all processing happens concurrently
 		go func(mmf *pb.MatchmakingFunctionSpec) error {
 			defer mmfwg.Done()
-
+			// var init
 			var err error
 			err = nil
 
-			// Connect to gRPC server
+			// Connect to gRPC server for this mmf.
 			mmfHost := mmf.GetHost()
 			if mmf.GetPort() > 0 {
 				mmfHost = fmt.Sprintf("%v:%v", mmfHost, mmf.GetPort())
 			}
 			if mmf.GetType() == pb.MatchmakingFunctionSpec_REST {
-				logger.Error("")
+				// OM1 allowed MMFs to use HTTP RESTful grpc implementations,
+				// but its usage was incredibly low. This is where that should
+				// be re-implemented if we see enough user demand.
 				err = status.Error(codes.Internal, fmt.Errorf("REST Mmf invocation NYI %v: %w", mmfHost, err).Error())
+
 			} else { // TODO: gRPC is default for legacy OM1 reasons, need to swap enum order in pb to change
 
-				// TODO: proper client caching/re-use
+				logger := logger.WithFields(logrus.Fields{
+					"mmf_name": mmf.GetName(),
+					"mmf_addr": mmfHost,
+				})
+
+				// TODO: Future Optimization: cache connections/clients using a pool and re-use
 				var conn *grpc.ClientConn
 				conn, err = grpc.Dial(mmfHost, opts...)
 				if err != nil {
+					logger.Errorf("Error connecting to MMF %v", err)
 					return status.Error(codes.Internal, fmt.Errorf("Failed to make gRPC client connection for %v: %w", mmfHost, err).Error())
 				}
 				defer conn.Close()
 				client := pb.NewMatchMakingFunctionServiceClient(conn)
-				logger.Debugf("connected to %v", mmfHost)
-				logger.Infof("connected to %v", mmfHost)
+				logger.Debugf("connected to MMF")
 
-				// Set a timeout for this API call, but don't respect cancelling the parent context, use the empty background context instead.
-				ctx, cancel := context.WithTimeout(context.Background(), (time.Duration(cfg.GetInt("OM_MMF_TIMEOUT_SECS")) * time.Second))
-				//ctx, cancel := context.WithCancel(context.Background())
+				// Set a timeout for this API call, but use the empty
+				// background context. It is fully intended that MMFs can run
+				// longer than the matchmaker is willing to wait, so we want
+				// them not to get cancelled when the calling matchmaker
+				// cancels its context. However, best practices dictate that
+				// we define /some/ timeout (default: 10 mins)
+				ctx, cancel := context.WithTimeout(context.Background(), mmfTimeout)
 				defer cancel()
-
-				//logger.Debugf("Connected to MMF '%v' at %v", mmf.GetName(), mmfHost)
-				logger.Infof("Connected to MMF '%v' at %v", mmf.GetName(), mmfHost)
 
 				// Run the MMF
 				var mmfStream pb.MatchMakingFunctionService_RunClient
@@ -754,44 +568,65 @@ func (s *grpcServer) InvokeMatchmakingFunctions(req *pb.MmfRequest, stream pb.Op
 				if err != nil {
 					return status.Error(codes.Internal, fmt.Errorf("Failed to connect to MMF at %v: %w", mmfHost, err).Error())
 				}
-				logger.Infof("Waiting for results from '%v' at %v", mmf.GetName(), mmfHost)
+				logger.Debugf("waiting for results")
 
 				// Request itself is chunked if all the tickets returned in
 				// ticket pools result in a total request size larger than the
 				// default gRPC message size of 4mb.
 				for index, chunk := range chunkedRequest {
 					mmfStream.Send(chunk)
-					logger.Infof("MMF request chunk %02d/%02d: %0.2fmb", index+1, len(chunkedRequest), float64(proto.Size(chunk))/float64(1024*1024))
+					logger.Debugf("MMF request chunk %02d/%02d: %0.2fmb", index+1, len(chunkedRequest), float64(proto.Size(chunk))/float64(1024*1024))
 				}
 
+				// Make a waitgroup that lets us know when all ticket
+				// deactivations are complete. (All tickets in matches returned
+				// by the MMF are set to inactive by OM)
 				var tdwg sync.WaitGroup
-				for {
+
+				// i counts the number of loops for metrics reporting; this
+				// loop reads streaming match responses from the mmf and runs
+				// until a break statement is encountered.
+				var i int64
+				for i = 1; true; i++ {
 					// Get results from MMF
 					var result *pb.StreamedMmfResponse
 					result, err = mmfStream.Recv()
-					if errors.Is(err, io.EOF) { // io.EOF is the error grpc sends when the server closes a stream.
-						logger.Errorf("MMF EOF '%v' at %v", mmf.GetName(), mmfHost)
+
+					// io.EOF is the error grpc sends when the server closes a stream.
+					if errors.Is(err, io.EOF) {
+						logger.Debugf("MMF stream complete")
 						break
 					}
 					if err != nil { // MMF has an error
-						logger.Errorf("MMF Error '%v' at %v", err, mmfHost)
+						logger.Errorf("MMF Error")
 						return status.Error(codes.Internal, fmt.Errorf("Unable to invoke MMF '%v' at %v: %w", mmf.GetName(), mmfHost, err).Error())
 					}
-					// Make a copy we can send to goroutines.
-					resultCopy := result.GetMatch()
 
 					// deactivate tickets & send match back to the matchmaker
+					// asynchronously as streamed match results continue to be
+					// processed.
+					//
 					// Note, even with the waitgroup, this implementation is
-					// only waiting until the deactivations is added to the
-					// local ticket cache. The distributed/eventually
+					// only waiting until the deactivations are replicated to
+					// the  local ticket cache. The distributed/eventually
 					// consistent nature of om-core implementation means there
 					// is no feasible way to wait for replication to every
 					// instance
+					//
+					// TODO: This section /could/ be optimized by
+					// de-duplicating tickets before sending them for
+					// deactivation, but we'd only expect big gains doing that
+					// if there are /lots/ of tickets appearing in multiple
+					// matches. Since we expect /most/ matchmakers to try and
+					// minimize collisions, it's likely a premature
+					// optimization to do this before we hear concrete feedback
+					// that it is a performance bottleneck.
+					resultCopy := result.GetMatch()
 					tdwg.Add(1)
 					go func(res *pb.Match) {
 						defer tdwg.Done()
 
-						// Get array of ticket ids to deactivate
+						// Get ticket ids to deactivate from all rosters in this match.
 						ticketIdsToDeactivate := []string{}
 						for _, roster := range res.GetRosters() {
 							for _, ticket := range roster.GetTickets() {
@@ -807,75 +642,83 @@ func (s *grpcServer) InvokeMatchmakingFunctions(req *pb.MmfRequest, stream pb.Op
 						}
 						logger.Debugf("Done deactivating tickets in %v", res.GetId())
 
-						// Wait for deactivation to complete BEFORE returning the match.
-						if cfg.GetBool("OM_MATCH_TICKET_DEACTIVATION_WAIT") {
-							replComplete := false
-							for !replComplete {
+						// Function to check if deactivation of the last ticket
+						// in this match's rosters has been replicated to the
+						// local cache
+						deactivationCheck := func(ticketId string) {
+							// We'd never expect the deactivation to take this
+							// long to replicate, but best practices require
+							// /some/ timeout.
+							timeout := time.After(time.Second * 60)
+							select {
+							case <-timeout:
+								// Log the timeout and continue.
+								logger.Errorf("Timeout while waiting for ticket %v deactivation to be replicated to local cache", ticketId)
+								return
+							default:
+								// There is always /some/ replication delay,
+								// sleep first
 								time.Sleep(100 * time.Millisecond)
-								// Check the deactivation has been replicated
-								// to the local ticket cache, after which
-								// we'll send back the match. Note: Other
-								// om-core instances may not have gotten these
-								// updates yet, but this is as good as we can
-								// get without adding a ton of complexity and
-								// slowing things down a lot by trying to
-								// verify the cache state of an arbitrary
-								// number of replicas.
-								logger.Debugf("checking for deactivation of ticket %v", ticketIdsToDeactivate[len(ticketIdsToDeactivate)-1])
-								_, replComplete = tc.inactiveSet.Load(ticketIdsToDeactivate[len(ticketIdsToDeactivate)-1])
+								if _, replComplete := tc.InactiveSet.Load(ticketId); replComplete == true {
+									logger.Debugf("deactivation of ticket %v replicated to local cache", ticketId)
+									return
+								}
 							}
-							logger.Debug("Matched tickets deactivation complete, returning match")
 						}
 
-						// Send back the match to the fan-in function.
-						logger.Debugf("sending '%v' from mmf '%v' to output queue", mmf.GetName(), res.GetId())
-						//logger.Infof("sending '%v' from mmf '%v' to output queue", mmf.GetName(), res.GetId())
+						// Option 1: Wait for deactivation to complete BEFORE
+						// returning the match.
+						if cfg.GetBool("OM_MATCH_TICKET_DEACTIVATION_WAIT") {
+							deactivationCheck(ticketIdsToDeactivate[len(ticketIdsToDeactivate)-1])
+							logger.Debug("ticket deactivations complete, returning match")
+						}
+
+						// Send back the match on the channel, which is consumed
+						// in the MMF Result fan-in goroutine above.
+						logger.WithFields(logrus.Fields{
+							"match_id": res.GetId(),
+						}).Debugf("sending match to InvokeMMF() output queue")
 						matchChan <- res
 
-						// Match already returned; don't exit goroutine until
-						// deactivation is complete.
-						// TODO: This could be optimized by de-duplicating
-						// tickets before deactivating, but we'd only expect
-						// big gains if there is significant ticket collision
-						// in matches. Since we expect most matchmakers to try
-						// and minimize collisions, it's likely a premature
-						// optimization to do this before we know how often it
-						// is a significant performance gain.
+						// Option 2: Match already returned; clean up
+						// goroutine when deactivation is complete.
 						if !cfg.GetBool("OM_MATCH_TICKET_DEACTIVATION_WAIT") {
-							replComplete := false
-							for !replComplete {
-								time.Sleep(100 * time.Millisecond)
-								// Check the replication ID of the local ticket
-								// cache, if it has passed the last
-								// deactivcation repliation id, we can exit
-								// this goroutine.
-								logger.Debugf("checking for deactivation of ticket %v", ticketIdsToDeactivate[len(ticketIdsToDeactivate)-1])
-								_, replComplete = tc.inactiveSet.Load(ticketIdsToDeactivate[len(ticketIdsToDeactivate)-1])
-							}
-							logger.Debug("Matched tickets deactivation complete for previously returned match")
+							deactivationCheck(ticketIdsToDeactivate[len(ticketIdsToDeactivate)-1])
+							logger.Debug("ticket deactivations complete for previously returned match")
 						}
 						return
-					}(resultCopy)
+					}(resultCopy) // End of match return & ticket deactivation goroutine
 
-				}
+				} // End of match stream receiving loop
 
-				// Wait for all match ticket deactivations to complete.
+				// TODO decide if we want to track profile names as attributes
+				// as well as mmf names. Profile names are user input, so we'd
+				// have to limit cardinality somehow. Really we should address
+				// the possiblity of too many mmf names causing cardinality
+				// problems too, but it's a relatively low-risk assumption that
+				// the user will only deploy a few different mmfs.
+				Matches.Add(ctx, i, metric.WithAttributes(attribute.String("mmf.name", mmf.GetName())))
+
+				// Wait for all match ticket deactivation goroutines to complete.
 				tdwg.Wait()
 			}
+
+			// io.EOF indicates the MMF server closed the stream (mmf is
+			// complete), so don't log if that's the type of error in var err
+			// (it's not a failure)
 			if err != nil && !errors.Is(err, io.EOF) {
-				// io.EOF indicates the MMF server closed the stream (mmf is complete)
 				logger.Error(err)
 			}
-			//logger.Debugf("async call to mmf '%v' at %v complete", mmf.GetName(), mmfHost)
-			logger.Infof("async call to mmf '%v' at %v complete", mmf.GetName(), mmfHost)
+			logger.Debug("async call to mmf complete")
 			return err
-		}(mmf)
+		}(mmf) // End of MMF fan-out goroutine
 	}
 
 	// TODO switch to an errgroup that works with contexts.
 	// https://stackoverflow.com/questions/71246253/handle-goroutine-termination-and-error-handling-via-error-group
 	// Wait for all mmfs to complete.
 	mmfwg.Wait()
+	logger.Debugf("MMF waitgroup done; closing waitchan")
 	close(waitChan)
 	return nil
 }
@@ -888,10 +731,9 @@ func (s *grpcServer) InvokeMatchmakingFunctions(req *pb.MmfRequest, stream pb.Op
 // the provided roster, assigning it to the server provided in the roster's
 // Assignment field.
 func (s *grpcServer) CreateAssignments(parentCtx context.Context, req *pb.CreateAssignmentsRequest) (*pb.CreateAssignmentsResponse, error) {
-	logger := logrus.WithFields(logrus.Fields{
-		"app":       "open_match",
-		"component": "core",
-		"rpc":       "CreateAssignments",
+	logger := logger.WithFields(logrus.Fields{
+		"stage": "handling",
+		"rpc":   "CreateAssignments",
 	})
 
 	// Input validation
@@ -910,19 +752,19 @@ func (s *grpcServer) CreateAssignments(parentCtx context.Context, req *pb.Create
 	for _, ticket := range req.GetAssignmentRoster().GetTickets() {
 		if ticket.Id != "" {
 			logger.Debugf("Assignment request ticket id: %v", ticket.Id)
-			tc.upRequests <- &cacheUpdateRequest{
+			tc.UpRequests <- &cache.UpdateRequest{
 				// This command is replicated to all other om-core instances
 				// using the batch writing async goroutine
-				// outgoingReplicationQueue() and its effect is applied to the
+				// tc.OutgoingReplicationQueue() and its effect is applied to the
 				// local ticket cache in the update processing async goroutine
-				// incomingReplicationQueue().
-				resultsChan: rChan,
-				ctx:         parentCtx,
-				update: store.StateUpdate{
+				// tc.IncomingReplicationQueue().
+				Update: store.StateUpdate{
 					Cmd:   store.Assign,
 					Key:   ticket.Id,
 					Value: string(assignmentPb[:]),
 				},
+				ResultsChan: rChan,
+				Ctx:         parentCtx,
 			}
 			numUpdates++
 		} else {
@@ -945,6 +787,10 @@ func (s *grpcServer) CreateAssignments(parentCtx context.Context, req *pb.Create
 	}
 
 	logger.Debugf("DEPRECATED CreateAssignments: %v tickets given assignment \"%v\"", numUpdates, req.GetAssignmentRoster().GetAssignment().GetConnection())
+
+	// Record metrics
+	AssignmentsPerCall.Record(parentCtx, int64(numUpdates))
+
 	return &pb.CreateAssignmentsResponse{}, nil
 }
 
@@ -957,10 +803,9 @@ func (s *grpcServer) CreateAssignments(parentCtx context.Context, req *pb.Create
 // those assignments back to the caller.  This is rather limited functionality
 // as reflected by this function's deprecated status.
 func (s *grpcServer) WatchAssignments(req *pb.WatchAssignmentsRequest, stream pb.OpenMatchService_WatchAssignmentsServer) error {
-	logger := logrus.WithFields(logrus.Fields{
-		"app":       "open_match",
-		"component": "core",
-		"rpc":       "WatchAssignments",
+	logger := logger.WithFields(logrus.Fields{
+		"stage": "handling",
+		"rpc":   "WatchAssignments",
 	})
 
 	logger.Debugf("ticketids to watch: %v", req.GetTicketIds())
@@ -976,7 +821,7 @@ func (s *grpcServer) WatchAssignments(req *pb.WatchAssignmentsRequest, stream pb
 		// channel, then exits.
 		go func(ticketId string) {
 			for {
-				if value, ok := tc.assignments.Load(ticketId); ok {
+				if value, ok := tc.Assignments.Load(ticketId); ok {
 					assignment := value.(*pb.Assignment)
 					logger.Debugf(" watchassignments loop got assignment %v for ticketid: %v",
 						assignment.Connection, ticketId)
@@ -992,27 +837,33 @@ func (s *grpcServer) WatchAssignments(req *pb.WatchAssignmentsRequest, stream pb
 			}
 		}(id)
 
+		// Get creation timestamp from ID
 		x, err := strconv.ParseInt(strings.Split(id, "-")[0], 0, 64)
 		if err != nil {
 			logger.Error(err)
 		}
 		ticketCtime := time.Unix(x, 0)
+
 		// find the newest ticket creation time.
 		if ticketCtime.After(newestTicketCtime) {
 			newestTicketCtime = ticketCtime
 		}
 	}
+	AssignmentWatches.Add(context.Background(), int64(len(req.GetTicketIds())))
 
 	// loop once per result we want to get.
 	// Exit when we've gotten all results or timeout is reached.
 	// From newest ticket id, get the ticket creation time and deduce the max
 	// time to wait from it's creation time + configured TTL
-	timeout := time.After(time.Until(newestTicketCtime.Add(time.Second * time.Duration(cfg.GetInt("OM_TICKET_TTL_SECS")))))
-	for _, _ = range req.GetTicketIds() {
+	// This is a very naive implementation. This functionality is deprecated.
+	timeout := time.After(time.Until(newestTicketCtime.Add(time.Second * time.Duration(cfg.GetInt("OM_CACHE_TICKET_TTL_SECS")))))
+	for i, _ := range req.GetTicketIds() {
 		select {
 		case thisAssignment := <-updateChan:
+			AssignmentWatches.Add(context.Background(), -1)
 			stream.Send(thisAssignment)
 		case <-timeout:
+			AssignmentWatches.Add(context.Background(), int64(len(req.GetTicketIds())-i))
 			return nil
 		}
 	}
@@ -1023,7 +874,11 @@ func (s *grpcServer) WatchAssignments(req *pb.WatchAssignmentsRequest, stream pb
 // validateTicketIds checks each id in the input list, and sends back
 // separate lists of those that are valid and those that are invalid.
 func validateTicketIds(ids []string) (validIds, invalidIds []string) {
-	validationRegex := regexp.MustCompile(tc.replicator.GetReplIdValidationRegex())
+	logger := logger.WithFields(logrus.Fields{
+		"stage": "validation",
+	})
+
+	validationRegex := regexp.MustCompile(tc.Replicator.GetReplIdValidationRegex())
 	for _, id := range ids {
 		logger.Debugf("Validating ticket id %v", id)
 		if validationRegex.MatchString(id) {
@@ -1042,7 +897,8 @@ func validateTicketIds(ids []string) (validIds, invalidIds []string) {
 // gRPC API guidelines explains more about best practices using these.
 // https://cloud.google.com/apis/design
 //
-// TODO: This is a POC implemention and needs to be expanded and finalized.
+// TODO: This is a POC implemention and needs to be expanded and finalized once
+// we understand the kinds of potential errors it is passing back.
 func addStateUpdateErrorDetails(errs map[string]error) error {
 	st := status.New(codes.OK, "")
 	if len(errs) > 0 {
@@ -1067,63 +923,13 @@ func addStateUpdateErrorDetails(errs map[string]error) error {
 	return st.Err()
 }
 
-// updateTicketsActiveState accepts a list of ticketids to (de-)activate, and
-// generates cache updates for each.
-//
-// NOTE This function does no input validation, that responsibility falls on the
-// function calling this one.
-func updateTicketsActiveState(parentCtx context.Context, ticketIds []string, command int) map[string]error {
-	logger := logrus.WithFields(logrus.Fields{
-		"app":       "open_match",
-		"component": "core",
-		"rpc":       "updateTicketsActiveState",
-	})
-
-	errs := map[string]error{}
-
-	rChan := make(chan *store.StateResponse, len(ticketIds))
-	defer close(rChan)
-
-	numUpdates := 0
-	for _, id := range ticketIds {
-		logger.Debugf("update ticket status request id: %v", id)
-		tc.upRequests <- &cacheUpdateRequest{
-			// This command (adding/removing the id to the inactive list)
-			// is replicated to all other om-core instances using the batch
-			// writing async goroutine outgoingReplicationQueue() and its
-			// effect is applied to the local ticket cache in the update
-			// processing async goroutine incomingReplicationQueue().
-			resultsChan: rChan,
-			ctx:         parentCtx,
-			update: store.StateUpdate{
-				Cmd: command,
-				Key: id,
-			},
-		}
-		numUpdates++
-	}
-
-	// look through all results for errors
-	for i := 0; i < len(ticketIds); i++ {
-		results := <-rChan
-
-		if results.Err != nil {
-			// Wrap redis error and give it a gRPC internal server error status code
-			// The results.result field contains the ticket id that generated the error.
-			errs[results.Result] = fmt.Errorf("Unable to update ticket state: %w", results.Err)
-			logger.Error(errs[results.Result])
-		}
-	}
-	return errs
-}
-
-// dump is a simple helper function to convert a sync.Map into a standard
-// golang map. Since a standard map is not concurrent-safe, use this with
-// caution. Most of the places this is used are either for debugging the
+// syncMapDump is a simple helper function to convert a sync.Map into a
+// standard golang map. Since a standard map is not concurrent-safe, use this
+// with caution. Most of the places this is used are either for debugging the
 // internal state of the om-core ticket cache, or in portions of the code where
 // the implementation depends on taking a 'point-in-time' snapshot of the
 // ticket cache because we're sending it to another process using invokeMMF()
-func dump(sm *sync.Map) map[string]interface{} {
+func syncMapDump(sm *sync.Map) map[string]interface{} {
 	out := map[string]interface{}{}
 	sm.Range(func(key, value interface{}) bool {
 		out[fmt.Sprint(key)] = value
@@ -1137,9 +943,9 @@ func dump(sm *sync.Map) map[string]interface{} {
 //
 // NOTE the limitation that this is taking a 'point-in-time' snapshot of the
 // two sets, as they are still being updated asynchronously in a number of
-// other goroutines.
+// other goroutines. The rest of the design of OM takes this into account.
 func setDifference(tix *sync.Map, inactiveSet *sync.Map) (activeTickets []any) {
-	inactiveTicketIds := dump(inactiveSet)
+	inactiveTicketIds := syncMapDump(inactiveSet)
 	// Copy the ticket cache, leaving out inactive tickets.
 	tix.Range(func(id, ticket any) bool {
 		// not ok means an error was encountered, indicating this

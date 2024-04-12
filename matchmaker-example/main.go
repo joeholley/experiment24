@@ -53,13 +53,16 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"flag"
 	"fmt"
 	"io"
 	"log"
+	"math"
 	"math/rand"
+	"net/http"
 	_ "net/http"
 	_ "net/http/pprof"
 	"strconv"
@@ -69,23 +72,26 @@ import (
 	"github.com/sirupsen/logrus"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
+	"google.golang.org/protobuf/encoding/protojson"
 	"google.golang.org/protobuf/types/known/timestamppb"
 	"open-match.dev/functions/golang/battleroyale"
 	"open-match.dev/functions/golang/soloduel"
+	"open-match.dev/functions/golang/teamshooter"
 	mmf "open-match.dev/mmf/server"
 	pb "open-match.dev/pkg/pb/v2"
 )
 
 var (
-	serverAddr    = flag.String("omhost", "localhost:8080", "The om-core server host:port")
-	mmfServerAddr = flag.String("mmfhost", "localhost:8081", "The host:port to bind the MMF server to")
-	mmCycles      = flag.Int("cycles", 20, "number of times to invoke MMFs")
-	numTickets    = flag.Int("tix", 60, "number of tickets to simulate per second")
-	duration      = flag.Int("dur", 60, "number seconds to simulate player clients requesting matchmaking")
-	simPlayers    = flag.Bool("sim", false, "turn on simulation of player clients requesting matchmaking")
-	verbose       = flag.Bool("v", false, "verbose")
-	startTime     time.Time
-	logger        = logrus.WithFields(logrus.Fields{
+	connType    = flag.String("conn", "http", "Type of connection to make to om-core: ['http' (default), 'grpc']")
+	serverAddr  = flag.String("omhost", "localhost:8080", "The om-core server host:port")
+	mmCycles    = flag.Int("cycles", math.MaxInt32, "number of times to invoke MMFs")
+	numTickets  = flag.Int("tix", 500, "number of tickets to simulate per second")
+	duration    = flag.Int("dur", math.MaxInt32, "number seconds to simulate player clients requesting matchmaking")
+	simPlayers  = flag.Bool("sim", true, "turn on simulation of player clients requesting matchmaking")
+	verbose     = flag.Bool("v", false, "verbose")
+	ignoreEmpty = flag.Bool("ignoreempty", false, "Don't exit on three consecutive empty MMF result cycles")
+	startTime   time.Time
+	logger      = logrus.WithFields(logrus.Fields{
 		"app": "matchmaker_example",
 	})
 )
@@ -135,31 +141,46 @@ func main() {
 		Type: pb.MatchmakingFunctionSpec_GRPC,
 	}
 	go func() { mmf.StartServer(mmfBrSpec.Port, mmfBr) }()
+	mmfTeam := &teamshooter.MmfServer{}
+	mmfTeamSpec := &pb.MatchmakingFunctionSpec{
+		Name: "teamshooter",
+		Host: "localhost",
+		Port: 8083,
+		Type: pb.MatchmakingFunctionSpec_GRPC,
+	}
+	go func() { mmf.StartServer(mmfTeamSpec.Port, mmfTeam) }()
 	mmfSpecs := []*pb.MatchmakingFunctionSpec{
 		mmfFifoSpec,
 		mmfBrSpec,
+		mmfTeamSpec,
 	}
 
 	// Connect to om-core server
-	log.Printf("Connecting to OM Core at %v", *serverAddr)
+	var grpcClient pb.OpenMatchServiceClient
+	var httpClient *http.Client
+	log.Printf("Connecting to OM Core using grpc at %v", *serverAddr)
 	conn, err := grpc.Dial(*serverAddr, opts...)
 	if err != nil {
 		log.Fatalf("fail to dial: %v", err)
 	}
 	//defer conn.Close() // not needed, the conn is in scope for this entire example
-	client := pb.NewOpenMatchServiceClient(conn)
-	log.Printf("Connected to OM Core at %v", *serverAddr)
+	grpcClient = pb.NewOpenMatchServiceClient(conn)
+	log.Printf("Connected to OM Core using grpc at %v", *serverAddr)
+	log.Printf("Connecting to OM Core using http at %v", *serverAddr)
+	httpClient = &http.Client{}
+	log.Printf("Connected to OM Core using http at %v", *serverAddr)
 
 	// Set timeout for this API call
-	connDuration := 300
-	ctx, cancel := context.WithTimeout(context.Background(), time.Duration(connDuration)*time.Second)
-	log.Printf("Maximum connection duration %v seconds", connDuration)
-	defer cancel()
+	//connDuration := 300
+	//ctx, cancel := context.WithTimeout(context.Background(), time.Duration(connDuration)*time.Second)
+	//log.Printf("Maximum connection duration %v seconds", connDuration)
+	//defer cancel()
+	ctx := context.Background()
 
 	// Start mock MatchMaker frontend to simulate game client players queuing
 	// for matchmaking
 	if *simPlayers {
-		mmfe := newMockMatchmakerFrontend(*duration, *numTickets, client)
+		mmfe := newMockMatchmakerFrontend(*duration, *numTickets, grpcClient, httpClient)
 		go mmfe.Run(ctx)
 	}
 
@@ -173,74 +194,161 @@ func main() {
 
 		// InvokeMmfs Example
 		logger.Debugf("Invokingmmfs")
-		stream, err := client.InvokeMatchmakingFunctions(ctx, &pb.MmfRequest{
+		reqPb := &pb.MmfRequest{
+			Mmfs: mmfSpecs,
 			Profile: &pb.Profile{
-				Name: "profile1",
+				Name: "example_profile",
 				Pools: map[string]*pb.Pool{
-					"pool1": &pb.Pool{
-						Name: "undifferentiated_tickets",
+					// Pool of tickets where the player selected a tank class
+					"tank": &pb.Pool{Name: "tank",
 						StringEqualsFilters: []*pb.Pool_StringEqualsFilter{
-							&pb.Pool_StringEqualsFilter{
-								StringArg: "mode", Value: "casual",
-							},
+							&pb.Pool_StringEqualsFilter{StringArg: "class", Value: "tank"},
 						},
 					},
-					//"pool2": &pb.Pool{
-					//	Name: "pool2",
-					//	StringEqualsFilters: []*pb.Pool_StringEqualsFilter{
-					//		&pb.Pool_StringEqualsFilter{
-					//			StringArg: "this", Value: "that",
-					//		},
-					//	},
-					//},
+					// Pool of tickets where the player selected a dps class
+					"dps": &pb.Pool{Name: "dps",
+						StringEqualsFilters: []*pb.Pool_StringEqualsFilter{
+							&pb.Pool_StringEqualsFilter{StringArg: "class", Value: "dps"},
+						},
+					},
+					// Pool of tickets where the player selected a healer class
+					"healer": &pb.Pool{Name: "healer",
+						StringEqualsFilters: []*pb.Pool_StringEqualsFilter{
+							&pb.Pool_StringEqualsFilter{StringArg: "class", Value: "healer"},
+						},
+					},
 				},
 			},
-			Mmfs: mmfSpecs,
-		})
-		if err != nil {
-			log.Fatalf("Invokemmf failed: %v", err)
 		}
 
-		// Loop to gather all streaming matches.
-		for {
-			var res *pb.StreamedMmfResponse
-			res, err = stream.Recv()
-			if errors.Is(err, io.EOF) { // stream complete
-				logger.Infof("MMFs complete: %v", err)
-				err = nil
-				break
-			}
-			if err != nil { // server returned an error
-				logger.Errorf("mmf returned err: %v", err)
-				break
+		var resPb *pb.StreamedMmfResponse
+		if *connType == "grpc" {
+			stream, err := grpcClient.InvokeMatchmakingFunctions(ctx, reqPb)
+			if err != nil {
+				log.Fatalf("Invokemmf failed: %v", err)
 			}
 
-			// We got a match result
-			// DEBUG: print the match to console
-			// spew.Dump(res)
-			//
-			// Simulate 1 in 100 matches being rejected by our matchmaker because
-			// we don't like them or don't have available servers to host the sessions
-			// right now.
-			if rand.Intn(100) <= 1 {
-				rejectedMatchesCounter.Add(ctx, 1)
-				rejectedMatches = append(rejectedMatches, res.GetMatch())
-			} else {
-				acceptedMatchesCounter.Add(ctx, 1)
-				matches = append(matches, res.GetMatch())
+			// Loop to gather all streaming matches.
+			for {
+				resPb, err = stream.Recv()
+				if errors.Is(err, io.EOF) { // stream complete
+					logger.Infof("MMFs complete: %v", err)
+					err = nil
+					break
+				}
+				if err != nil { // server returned an error
+					logger.Errorf("MMF returned err: %v", err)
+					break
+				}
+
+				// We got a match result
+				// DEBUG: print the match to console
+				// spew.Dump(res)
+				//
+				// Simulate 1 in 100 matches being rejected by our matchmaker because
+				// we don't like them or don't have available servers to host the sessions
+				// right now.
+				if rand.Intn(100) <= 1 {
+					rejectedMatchesCounter.Add(ctx, 1)
+					rejectedMatches = append(rejectedMatches, resPb.GetMatch())
+				} else {
+					acceptedMatchesCounter.Add(ctx, 1)
+					matches = append(matches, resPb.GetMatch())
+				}
 			}
+		} else {
+			reqJson, err := protojson.Marshal(reqPb)
+			if err != nil {
+				logger.WithFields(logrus.Fields{
+					"pb_message": "MmfRequest",
+				}).Errorf("cannot marshal protobuf to json")
+			}
+
+			// Set up our request parameters
+			req, err := http.NewRequestWithContext(
+				ctx,    // Context
+				"POST", // HTTP verb
+				"http://localhost:58081/v2/matches:fetch", // RESTful OM2 path
+				bytes.NewReader(reqJson),                  // JSON-marshalled protobuf request message
+			)
+			if err != nil {
+				logger.Errorf("cannot create http request with context")
+			}
+			req.Header.Set("Content-Type", "application/json")
+
+			// Send request
+			resp, err := httpClient.Do(req)
+			if err != nil {
+				logger.Errorf("cannot execute http request")
+			}
+			// Check for a successful HTTP status code
+			if resp.StatusCode != http.StatusOK {
+				log.Fatalf("Request failed with status: %s", resp.Status)
+			}
+
+			// Process the stream
+			for {
+				// Simulate message decoding (adjust based on your actual message format)
+				var msg string
+				_, err := fmt.Fscanf(resp.Body, "%s\n", &msg)
+
+				if err == io.EOF {
+					resp.Body.Close()
+					break // End of stream
+				}
+				if err != nil {
+					resp.Body.Close()
+					logger.Fatalf("Error reading stream: %v", err)
+				}
+
+				// NOTE: this is NOT a clean implementation.
+				// grpc-gateway returns your result inside a JSON
+				// container under the key 'result', so the actual text we need
+				// to pass to protojson.Unmarshal needs to omit the top level
+				// JSON object. Rather than marshal the text to json (which is
+				// slow), we just slice off the first 10 letters
+				// '{"result":'
+				// and the last character '}' (which is fast, but brittle)
+				trimmedMsg := msg[10:(len(msg) - 1)]
+				// Unmarshal json back into protobuf
+				resPb = &pb.StreamedMmfResponse{}
+				err = protojson.Unmarshal([]byte(trimmedMsg), resPb)
+				if err != nil {
+					logger.WithFields(logrus.Fields{
+						"pb_message": "StreamedMmfResponse",
+					}).Errorf("cannot unmarshal http response body back into protobuf")
+				}
+
+				// We got a match result
+				// DEBUG: print the match to console
+				// spew.Dump(res)
+				//
+				// Simulate 1 in 100 matches being rejected by our matchmaker because
+				// we don't like them or don't have available servers to host the sessions
+				// right now.
+				if rand.Intn(100) <= 1 {
+					rejectedMatchesCounter.Add(ctx, 1)
+					rejectedMatches = append(rejectedMatches, resPb.GetMatch())
+				} else {
+					acceptedMatchesCounter.Add(ctx, 1)
+					matches = append(matches, resPb.GetMatch())
+				}
+
+			}
+
 		}
 
 		// Print status for this cycle
-		log.Printf("%02d/%02d Invokingmmfs complete, %v matches received, %v approved %v rejected, error: %v",
-			*mmCycles-i, *mmCycles,
+		logger.Infof("%02d/%02d Invokingmmfs complete, %v matches received, %v approved %v rejected, error: %v",
+			*mmCycles+1-i, *mmCycles,
 			len(matches)+len(rejectedMatches), len(matches), len(rejectedMatches), err)
 
-		// Exit if we've seen three consequtive MMF invocations with no
+		// Exit if we've seen three consecutive MMF invocations with no
 		// matches; something's likely broken or the fake frontend is not
 		// configured to generate any more mock player tickets.
 		if (len(matches) + len(rejectedMatches)) == 0 {
-			if emptyCycles >= 3 {
+			if !*ignoreEmpty && emptyCycles >= 3 {
+				logger.Warn("No matches returned from three consecutive MMF invocations; exiting. Turn this feature off with -ignoreempty flag")
 				break
 			}
 			// TODO: proper exp BO + jitter
@@ -260,10 +368,10 @@ func main() {
 					}
 				}
 			}
-			log.Printf("Queued %v tickets to be re-activated due to rejected matches", numRejectedTickets)
+			logger.Infof("Queued %v tickets to be re-activated due to rejected matches", numRejectedTickets)
 			// DEBUG: just helps distinguish from initial ticket activations in traces and logs.
 			ctx := context.WithValue(ctx, "type", "re-activate")
-			activateTickets(ctx, client, ticketIdsToActivate)
+			activateTickets(ctx, grpcClient, httpClient, ticketIdsToActivate)
 		}
 	}
 
@@ -274,7 +382,7 @@ func main() {
 // into calls of the size defined in maxActivationsPerCall (see
 // open-match.dev/core/internal/config for limits on how many actions you can
 // request in a single API call, and use that value)
-func activateTickets(ctx context.Context, client pb.OpenMatchServiceClient, ticketIdsToActivate chan string) {
+func activateTickets(ctx context.Context, grpcClient pb.OpenMatchServiceClient, httpClient *http.Client, ticketIdsToActivate chan string) {
 	// Activate all new tickets
 	done := false
 	ticketsAwaitingActivation := make([]string, 0)
@@ -306,24 +414,63 @@ func activateTickets(ctx context.Context, client pb.OpenMatchServiceClient, tick
 			}
 
 			// Kick off activation in a goroutine in case we had to split on
-			// maxActivationsPerCall, this way they are made concurrently.
+			// maxActivationsPerCall, this way the calls are made concurrently.
 			go func(ticketsAwaitingActivation []string) {
+
+				// Quick in-line function to grab information
+				// the calling function put into the context when
+				// logging errors (to aid debugging)
+				callerFromContext := func() string {
+					ts, ok := ctx.Value("type").(string)
+					if !ok {
+						logger.Error("unable to get caller type from context")
+						return "undefined"
+					}
+					return ts
+				}
 
 				// Track this goroutine
 				activationWg.Add(1)
 				defer activationWg.Done()
 
 				// Activate tickets
-				res, err := client.ActivateTickets(ctx,
-					&pb.ActivateTicketsRequest{TicketIds: ticketsAwaitingActivation})
-				if err != nil {
-					ts, ok := ctx.Value("type").(string)
-					if !ok {
-						logger.Error("unable to get caller type from context")
+				reqPb := &pb.ActivateTicketsRequest{TicketIds: ticketsAwaitingActivation}
+				var resPb *pb.ActivateTicketsResponse
+				var err error
+
+				if *connType == "grpc" {
+					resPb, err = grpcClient.ActivateTickets(ctx, reqPb)
+				} else { // RESTful HTTP using JSON (grpc-gateway)
+					// Marshal request into json
+					req, err := protojson.Marshal(reqPb)
+					if err != nil {
+						logger.WithFields(logrus.Fields{
+							"caller":     callerFromContext,
+							"pb_message": "ActivateTicketsRequest",
+						}).Errorf("cannot marshal protobuf to json")
 					}
-					logger.Errorf("(%v) ActivateTickets failed: %v", ts, err)
+
+					// RESTful version of the ActivateTickets() call
+					body, err := restfulGrpcPost(ctx, httpClient, "tickets:activate", req)
+					if err == nil {
+						// Unmarshal response into protobuf
+						resPb = &pb.ActivateTicketsResponse{}
+						err = protojson.Unmarshal(body, resPb)
+						if err != nil {
+							logger.WithFields(logrus.Fields{
+								"caller":     callerFromContext,
+								"pb_message": "ActivateTicketsResponse",
+							}).Errorf("cannot unmarshal HTTP JSON response body back to protobuf")
+						}
+
+					}
 				}
-				logger.Debugf("ActivateTicket complete, results: %v", res)
+				if err != nil {
+					logger.WithFields(logrus.Fields{
+						"caller": callerFromContext,
+					}).Errorf("ActivateTickets failed: %w", err)
+				}
+				logger.Debugf("ActivateTicket complete, results: %v", resPb)
 			}(ticketsAwaitingActivation)
 		}
 	}
@@ -331,6 +478,37 @@ func activateTickets(ctx context.Context, client pb.OpenMatchServiceClient, tick
 	// After gathering all the activations and making all the necessary
 	// calls, wait on the waitgroup to finish.
 	activationWg.Wait()
+}
+
+func restfulGrpcPost(ctx context.Context, client *http.Client, urlpath string, pbReq []byte) ([]byte, error) {
+	// Set up our request parameters
+	req, err := http.NewRequestWithContext(
+		ctx,                                  // Context
+		"POST",                               // HTTP verb
+		"http://localhost:58081/v2/"+urlpath, // RESTful OM2 path
+		bytes.NewReader(pbReq),               // JSON-marshalled protobuf request message
+	)
+	if err != nil {
+		logger.Errorf("cannot create http request with context")
+		return nil, err
+	}
+	req.Header.Set("Content-Type", "application/json")
+
+	// Send request
+	resp, err := client.Do(req)
+	if err != nil {
+		logger.Errorf("cannot execute http request")
+		return nil, err
+	}
+
+	// Get results
+	body, err := io.ReadAll(resp.Body)
+	defer resp.Body.Close()
+	if err != nil {
+		logger.Errorf("cannot read bytes from http response body")
+		return nil, err
+	}
+	return body, err
 }
 
 // Convenience function for printing sync.Map data structures, used for debugging.
@@ -357,21 +535,38 @@ func dump(sm sync.Map) map[string]interface{} {
 // or dev kit encourages, and write your matchmaker frontend to parse it into
 // the correct protobuf message format.
 func generateMockClientRequest(ctx context.Context) *pb.Ticket {
+
+	// Make a fake game client request
 	crTime := time.Now()
 	s := strconv.FormatInt(crTime.UnixNano(), 10)
-	return &pb.Ticket{
+	ticket := &pb.Ticket{
 		Attributes: &pb.Ticket_FilterableData{
+			//StringArgs:   map[string]string{"mode": "casual"},
 			Tags:         []string{s},
-			StringArgs:   map[string]string{"mode": "casual"},
 			DoubleArgs:   map[string]float64{s: float64(crTime.UnixNano())},
 			CreationTime: timestamppb.New(crTime),
 		},
 	}
+
+	// Randomly select a character archetype this fake player wants to play
+	var selectedClass string
+	switch rand.Intn(5) + 1 { // 1d5
+	case 1:
+		selectedClass = "tank"
+	case 2:
+		selectedClass = "healer"
+	default: // 60% of players will select dps
+		selectedClass = "dps"
+	}
+	ticket.Attributes.StringArgs = map[string]string{"class": selectedClass}
+
+	return ticket
 }
 
 // Properties for our fake frontend.
 type mockMatchmakerFrontend struct {
-	client           pb.OpenMatchServiceClient
+	httpClient       *http.Client
+	grpcClient       pb.OpenMatchServiceClient
 	duration         int // How many seconds to generate tickets
 	ticketsPerSecond int // How many tickets to generate each second
 }
@@ -383,13 +578,13 @@ type mmFrontEnd interface {
 
 // newMockMatchmakerFrontend initializes a mock frontend service that simulates
 // players queuing for matchmaking every second
-func newMockMatchmakerFrontend(d int, t int, c pb.OpenMatchServiceClient) *mockMatchmakerFrontend {
+func newMockMatchmakerFrontend(d int, t int, g pb.OpenMatchServiceClient, h *http.Client) *mockMatchmakerFrontend {
 	return &mockMatchmakerFrontend{
-		client:           c,
+		httpClient:       h,
+		grpcClient:       g,
 		duration:         d,
 		ticketsPerSecond: t,
 	}
-
 }
 
 // Actually 'Run' the mock matchmaker frontend, generating tickets and activating them.
@@ -423,7 +618,7 @@ func (mmfe *mockMatchmakerFrontend) Run(ctx context.Context) {
 	go func() {
 		for {
 			ctx := context.WithValue(ctx, "type", "activate")
-			activateTickets(ctx, mmfe.client, ticketIdsToActivate)
+			activateTickets(ctx, mmfe.grpcClient, mmfe.httpClient, ticketIdsToActivate)
 			time.Sleep(1 * time.Second)
 		}
 	}()
@@ -454,12 +649,45 @@ func (mmfe *mockMatchmakerFrontend) proxyCreateTicket(gameClientRequest *pb.Tick
 	// With all matchmaking attributes collected from the client and the
 	// game backend services, we're now ready to put the ticket in open match.
 	logger.Debugf("ticket: %v", ticket)
-	res, err := mmfe.client.CreateTicket(ctx, &pb.CreateTicketRequest{Ticket: ticket})
+	reqPb := &pb.CreateTicketRequest{Ticket: ticket}
+	var resPb *pb.CreateTicketResponse
+	var err error
+	var buf []byte
+	ticketId := ""
+
+	if *connType == "grpc" {
+		resPb, err = mmfe.grpcClient.CreateTicket(ctx, reqPb)
+	} else { // RESTful http using grpc-gateway
+
+		// Marshal request into json
+		buf, err = protojson.Marshal(reqPb)
+		if err != nil {
+			logger.WithFields(logrus.Fields{
+				"pb_message": "CreateTicketsRequest",
+			}).Errorf("cannot marshal proto to json")
+		}
+
+		// RESTful version of the CreateTicket() call
+		buf, err = restfulGrpcPost(ctx, mmfe.httpClient, "tickets", buf)
+		if err == nil {
+
+			// Unmarshal json back into protobuf
+			resPb = &pb.CreateTicketResponse{}
+			err = protojson.Unmarshal(buf, resPb)
+			if err != nil {
+				logger.WithFields(logrus.Fields{
+					"pb_message": "CreateTicketsResponse",
+				}).Errorf("cannot unmarshal http response body back into protobuf")
+			}
+		}
+	}
 	if err != nil {
 		logger.Errorf("CreateTicket failed: %v", err)
 	}
 
-	ticketId := res.TicketId
+	if resPb != nil {
+		ticketId = resPb.TicketId
+	}
 	logger.Debugf("CreateTicket complete, ticketID: %v, err: %v", ticketId, err)
 	return ticketId
 }

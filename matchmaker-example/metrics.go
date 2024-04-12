@@ -84,9 +84,9 @@ func registerMetrics() {
 
 	// Start the prometheus HTTP server and pass the exporter Collector to it
 	go func() {
-		log.Printf("serving metrics at localhost:2223/metrics")
+		log.Printf("serving metrics at localhost:2233/metrics")
 		http.Handle("/metrics", promhttp.Handler())
-		err := http.ListenAndServe(":2223", nil) //nolint:gosec // Ignoring G114: Use of net/http serve function that has no support for setting timeouts.
+		err := http.ListenAndServe(":2233", nil) //nolint:gosec // Ignoring G114: Use of net/http serve function that has no support for setting timeouts.
 		if err != nil {
 			fmt.Printf("error serving http: %v", err)
 			return

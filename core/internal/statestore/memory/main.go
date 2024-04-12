@@ -46,12 +46,12 @@ func (rc *memoryReplicator) GetReplIdValidationRegex() string {
 // GetUpdates mocks how the statestore/redis module processes a Redis Stream XRANGE command.
 // https://redis.io/docs/data-types/streams/#querying-by-range-xrange-and-xrevrange
 func (rc *memoryReplicator) GetUpdates() (out []*store.StateUpdate) {
-	logger := logrus.WithFields(logrus.Fields{
+	logger := logger.WithFields(logrus.Fields{
 		"direction": "getUpdates",
 	})
 
 	// Timeout
-	timeout := time.After(time.Millisecond * time.Duration(rc.cfg.GetInt("OM_REDIS_PIPELINE_WAIT_TIMEOUT_MS")))
+	timeout := time.After(time.Millisecond * time.Duration(rc.cfg.GetInt("OM_CACHE_IN_WAIT_TIMEOUT_MS")))
 
 	// Local vars
 	var thisUpdate *store.StateUpdate
@@ -73,7 +73,7 @@ func (rc *memoryReplicator) GetUpdates() (out []*store.StateUpdate) {
 // SendUpdates mocks how the statestore/redis module processes a Redis Stream XADD command.
 // https://redis.io/docs/data-types/streams/#streams-basics
 func (rc *memoryReplicator) SendUpdates(updates []*store.StateUpdate) []*store.StateResponse {
-	logger := logrus.WithFields(logrus.Fields{
+	logger := logger.WithFields(logrus.Fields{
 		"direction": "sendUpdates",
 	})
 

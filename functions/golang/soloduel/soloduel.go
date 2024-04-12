@@ -66,14 +66,17 @@ func (s *MmfServer) Run(stream pb.MatchMakingFunctionService_RunServer) error {
 	logger.Infof("Generating matches for profile %v", req.GetName())
 
 	// Fetch tickets for the pools specified in the Match Profile.
-	// In this sample, just grab the first pool of tickets in the profile
-	// and ignore the rest.
+	// For this example, assume that the soloduel mode just matches
+	// players at random; every pool of tickets can be matched to
+	// each other.
 	tickets := []*pb.Ticket{}
 	for pname, pool := range req.GetPools() {
-		tickets = pool.GetParticipants().GetTickets()
+		for _, ticket := range pool.GetParticipants().GetTickets() {
+			tickets = append(tickets, ticket)
+		}
 		logger.Debugf("Found %v tickets in pool %v", len(tickets), pname)
-		logger.Infof("Found %v tickets in pool %v", len(tickets), pname)
 	}
+	logger.Debugf("Considering %v tickets from all pools", len(tickets))
 
 	t := time.Now().Format("2006-01-02T15:04:05.00")
 
@@ -130,7 +133,7 @@ func (s *MmfServer) Run(stream pb.MatchMakingFunctionService_RunServer) error {
 				},
 			},
 			}); err != nil {
-				logger.Debugf("Failed to stream proposals to Open Match, got %s", err.Error())
+				logger.Debugf("Failed to stream proposal to Open Match, got %s", err.Error())
 				return err
 			}
 

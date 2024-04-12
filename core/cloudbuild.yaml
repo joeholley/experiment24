@@ -1,0 +1,15 @@
+substitutions:
+  _ARTIFACT_REGISTRY_URI: asia-northeast1-docker.pkg.dev/fm-test02/fm-test01-registry
+  _IMAGE_TAG: latest
+steps:
+  - name: 'gcr.io/k8s-skaffold/pack'
+    entrypoint: pack
+    args: 
+      - build
+      - '${_ARTIFACT_REGISTRY_URI}/om-core:${_IMAGE_TAG}'
+      - --builder
+      - gcr.io/buildpacks/builder:latest
+      - --network
+      - cloudbuild
+images:
+  '${_ARTIFACT_REGISTRY_URI}/om-core:${_IMAGE_TAG}'
